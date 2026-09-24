@@ -1,0 +1,33 @@
+{
+  "object": "whatsapp_agent_platform",
+  "entry": [
+    {
+      "id": "123456789",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "contacts": [
+              {
+                "wa_id": "user:50972923564215",
+                "profile": { "name": "Alex" }
+              }
+            ],
+            "messages": [
+              {
+                "from": "user:50972923564215",
+                "id": "wamid.HBg...",
+                "timestamp": "1736844652",
+                "type": "text",
+                "text": { "body": "Hello agent" }
+              }
+            ],
+            "statuses": []
+          }
+        }
+      ]
+    }
+  ],
+  "next_offset": 1287
+}

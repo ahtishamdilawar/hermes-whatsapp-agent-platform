@@ -1,0 +1,28 @@
+name: whatsapp-agent-platform
+label: WhatsApp Agent Platform
+kind: platform
+version: 0.1.0
+description: >-
+  Chat with Hermes from a WhatsApp Agent via Meta's WhatsApp Agent Platform (long-poll
+  /agent/v1 API; no webhook, business number or WhatsApp Web session). Community plugin,
+  not affiliated with Meta.
+author: Ahtisham Dilawar
+license: MIT
+homepage: https://github.com/ahtishamdilawar/hermes-whatsapp-agent-platform
+requires_hermes: ">=0.21.4"
+requires_env:
+  - name: WHATSAPP_AGENT_PLATFORM_API_KEY
+    description: "Agent API key from WhatsApp (agent chat → Chat info → API key)"
+    prompt: "WhatsApp Agent Platform API key"
+    url: https://www.whatsapp.com/developer/WhatsApp-Agent-Platform-Developer-Manual.pdf
+    password: true
+optional_env:
+  - name: WHATSAPP_AGENT_PLATFORM_HOME_CHANNEL
+    description: "Cron/send_message default recipient: 'self' (the agent's creator, default) or user:<id>"
+    password: false
+  - name: WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS
+    description: "Comma-separated user:<id> senders to accept (default: only the agent's creator)"
+    password: false
+  - name: WHATSAPP_AGENT_PLATFORM_ALLOW_ALL_USERS
+    description: "true to accept any sender Meta delivers (not recommended)"
+    password: false

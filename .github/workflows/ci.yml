@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *" # nightly against Hermes main to catch upstream breakage early
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.15.10
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    name: pytest (Hermes ${{ matrix.hermes-ref }}, py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        hermes-ref: [main, v2026.9.21] # v2026.9.21 = Hermes 0.21.4, the requires_hermes floor
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes-ref }}
+          path: hermes-agent
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ./hermes-agent "pytest==9.1.1" "pytest-asyncio==1.3.0"
+      - run: python -m pytest tests -q
+
+  hermes-checks:
+    name: hermes plugins validate / compat / doctor (Hermes ${{ matrix.hermes-ref }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        hermes-ref: [main, v2026.9.21]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      # Bare install, no extras: the same environment the plugin-catalog admission CI uses.
+      - run: pip install "git+https://github.com/NousResearch/hermes-agent@${{ matrix.hermes-ref }}"
+      - run: hermes plugins validate .
+      - run: hermes plugins compat .
+      - run: hermes plugins doctor . --ci
+
+  version:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: plugin.yaml version matches the tag
+        run: |
+          manifest=$(sed -n 's/^version: *//p' plugin.yaml)
+          test "v${manifest}" = "${GITHUB_REF_NAME}" || { echo "plugin.yaml version ${manifest} != tag ${GITHUB_REF_NAME}"; exit 1; }

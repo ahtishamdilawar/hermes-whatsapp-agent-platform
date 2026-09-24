@@ -1,0 +1,12 @@
+{
+  "error": {
+    "message": "(#131009) Missing or malformed required fields",
+    "type": "OAuthException",
+    "code": 131009,
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "Invalid participant format; expected \"<type>:<int id>\", where type = agent|user"
+    },
+    "fbtrace_id": "AW7bqWj4..."
+  }
+}
