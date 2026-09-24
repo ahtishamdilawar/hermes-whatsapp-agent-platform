@@ -5,6 +5,8 @@ All notable changes to this plugin are documented here. Versions follow [SemVer]
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-24
+
 ### Added
 - Platform adapter `whatsapp_agent_platform` for Meta's WhatsApp Agent Platform (`/agent/v1`, manual v1).
 - Long-poll inbound (`GET /updates`) with a persisted cursor, restart-safe dedup, backlog skip on first
