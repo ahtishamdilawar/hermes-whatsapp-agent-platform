@@ -398,6 +398,8 @@ def test_register_declares_platform_capabilities():
     assert captured["max_message_length"] == 4096 and captured["pii_safe"] is True
     for hook in ("standalone_sender_fn", "parse_target_ref_fn", "env_enablement_fn", "setup_fn"):
         assert callable(captured[hook])
+    # The hint must ask for markdown: WhatsApp-style *bold* from the model would be converted to italics.
+    assert "markdown" in captured["platform_hint"] and "*bold*" not in captured["platform_hint"]
 
 
 def test_register_kwargs_are_valid_platform_entry_fields():

@@ -620,11 +620,15 @@ def _interactive_setup() -> None:
     )
 
 
+# Same contract as Hermes's built-in WhatsApp hint: the model writes standard markdown and
+# formatting.to_whatsapp converts it. (Asking for WhatsApp syntax directly would turn *bold*
+# into italics when converted.)
 PLATFORM_HINT = (
     "You are chatting via Meta's WhatsApp Agent Platform with the person who created this "
-    "agent. WhatsApp formatting only: *bold*, _italic_, ~strike~, ```code```; no tables or "
-    "headings. Sent messages cannot be edited or deleted, and each reply over 4096 characters "
-    "is split into several messages (max 12 per minute), so keep answers concise."
+    "agent. Standard markdown auto-converts to WhatsApp syntax (bold, italic, strike, monospace) "
+    "— write markdown freely, bullets included. No tables — use bullets or labeled lines. Sent "
+    "messages cannot be edited or deleted, and replies over 4096 characters are split into "
+    "several messages (max 12 per minute), so keep answers concise. Only text can be sent here."
 )
 
 
