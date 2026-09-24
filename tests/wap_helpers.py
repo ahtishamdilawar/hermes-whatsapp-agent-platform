@@ -46,6 +46,8 @@ class FakeMeta:
         self.queues: dict[str, collections.deque] = collections.defaultdict(collections.deque)
         self.requests: list[httpx.Request] = []
         self._wamid = 0
+        # Like Meta: POST /statuses answers 403/131005 for a message not sent by the creator.
+        self.not_creator_wamids: set[str] = set()
 
     def calls(self, endpoint: str) -> list[httpx.Request]:
         return [r for r in self.requests if r.url.path.endswith("/" + endpoint)]
@@ -67,6 +69,8 @@ class FakeMeta:
             return item(request) if callable(item) else item
         if endpoint == "updates":
             return httpx.Response(204)
+        if endpoint == "statuses" and json.loads(request.content).get("message_id") in self.not_creator_wamids:
+            return error_response(403, 131005)
         if endpoint == "messages":
             self._wamid += 1
             return httpx.Response(

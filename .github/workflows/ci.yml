@@ -25,15 +25,23 @@ jobs:
       - run: ruff format --check .
 
   test:
-    name: pytest (Hermes ${{ matrix.hermes-ref }}, py${{ matrix.python }})
-    runs-on: ubuntu-latest
+    name: pytest (Hermes ${{ matrix.hermes-ref }}, py${{ matrix.python }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         hermes-ref: [main, v2026.9.21] # v2026.9.21 = Hermes 0.21.4, the requires_hermes floor
         python: ["3.11", "3.12", "3.13"]
+        include:
+          - os: windows-latest
+            hermes-ref: main
+            python: "3.12"
     steps:
+      # Plugin and Hermes side by side, as after `hermes plugins install` (never Hermes inside the plugin).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: plugin
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: NousResearch/hermes-agent
@@ -44,6 +52,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -e ./hermes-agent "pytest==9.1.1" "pytest-asyncio==1.3.0"
       - run: python -m pytest tests -q
+        working-directory: plugin
 
   hermes-checks:
     name: hermes plugins validate / compat / doctor (Hermes ${{ matrix.hermes-ref }})
@@ -77,7 +86,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: plugin.yaml version matches the tag
+      - name: plugin.yaml and pyproject.toml versions match the tag
         run: |
           manifest=$(sed -n 's/^version: *//p' plugin.yaml)
+          project=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
           test "v${manifest}" = "${GITHUB_REF_NAME}" || { echo "plugin.yaml version ${manifest} != tag ${GITHUB_REF_NAME}"; exit 1; }
+          test "v${project}" = "${GITHUB_REF_NAME}" || { echo "pyproject.toml version ${project} != tag ${GITHUB_REF_NAME}"; exit 1; }

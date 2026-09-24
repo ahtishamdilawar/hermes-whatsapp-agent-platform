@@ -16,4 +16,6 @@
    ```
 4. Restart the gateway and message your agent. Only one process may poll a key at a time.
 
-Agent chats are **not end-to-end encrypted**: messages pass through Meta to this Hermes instance.
+Only the agent's creator can talk to Hermes: the plugin confirms the creator with Meta before dispatching a
+message. Per WhatsApp's Third-Party Agents Terms, agent chats are **not end-to-end encrypted**: messages pass
+through Meta to this Hermes instance.

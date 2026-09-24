@@ -46,3 +46,9 @@ def test_whatsapp_formatting():
 
 def test_formatting_strips_invisible_characters():
     assert to_whatsapp("a\u2060b\u00a0c") == "ab c"
+
+
+def test_formatting_leaves_identifiers_and_arithmetic_alone():
+    assert to_whatsapp("edit __init__.py") == "edit __init__.py"
+    assert to_whatsapp("$5*2*3") == "$5*2*3"
+    assert to_whatsapp("__strong__ word") == "*strong* word"

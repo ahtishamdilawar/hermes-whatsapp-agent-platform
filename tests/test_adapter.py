@@ -49,6 +49,12 @@ def dispatched(a) -> list:
     return [call.args[0] for call in a.handle_message.await_args_list]
 
 
+def saved_offset() -> int:
+    from hermes_constants import get_hermes_home
+
+    return PollState.load(state_path(get_hermes_home(), API_KEY)).next_offset
+
+
 # ---------------------------------------------------------------- lifecycle
 @pytest.mark.asyncio
 async def test_connect_probe_is_not_dispatched_then_loop_dispatches_once(meta, api_key, hermes_home):
@@ -107,13 +113,37 @@ async def test_second_adapter_for_same_key_in_process_is_refused(connected):
 
 
 @pytest.mark.asyncio
-async def test_poll_conflict_409_stops_polling(meta, api_key):
+async def test_single_poll_conflict_backs_off_and_resumes(meta, api_key):
     a = make_adapter()
+    a._conflict_backoff = 0.01
     assert await a.connect()
-    meta.queue("updates", error_response(409, 1752041))
+    meta.queue(
+        "updates", error_response(409, 1752041), updates_response(text_message("wamid.in1", "hi"), next_offset=2)
+    )
+    await until(lambda: a.handle_message.await_count == 1)
+    assert not a.has_fatal_error
+    await a.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_repeated_poll_conflicts_stop_polling(meta, api_key):
+    a = make_adapter()
+    a._conflict_backoff = 0.01
+    assert await a.connect()
+    meta.queue("updates", *[error_response(409, 1752041) for _ in range(3)])
     await until(lambda: a.has_fatal_error)
     assert a.fatal_error_code == "poll_conflict" and not a.fatal_error_retryable
     a._notify_fatal_error.assert_awaited()
+    await a.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_unknown_4xx_on_updates_backs_off_instead_of_stopping(meta, api_key):
+    a = make_adapter()
+    assert await a.connect()
+    meta.queue("updates", httpx.Response(407), updates_response(text_message("wamid.in1", "hi"), next_offset=2))
+    await until(lambda: a.handle_message.await_count == 1)
+    assert not a.has_fatal_error
     await a.disconnect()
 
 
@@ -162,31 +192,48 @@ async def test_restart_does_not_redeliver_handled_messages(meta, api_key):
     second = make_adapter()
     assert await second.connect()
     meta.queue("updates", updates_response(msg, next_offset=3))
-    await until(lambda: len(meta.queues["updates"]) == 0)
-    await asyncio.sleep(0.05)
+    await until(lambda: saved_offset() == 3)  # the page was fully processed
     await second.disconnect()
     assert second.handle_message.await_count == 0
 
 
 @pytest.mark.asyncio
-async def test_creator_is_pinned_and_other_senders_dropped(meta, api_key):
+async def test_creator_is_confirmed_by_meta_and_others_are_dropped(meta, api_key, hermes_home):
+    meta.not_creator_wamids.add("wamid.b")
     a = make_adapter()
     assert await a.connect()
+    # The stranger's message comes first: it must not be pinned as the creator.
     meta.queue(
         "updates",
         updates_response(
-            text_message("wamid.a", "me"), text_message("wamid.b", "stranger", sender=OTHER), next_offset=4
+            text_message("wamid.b", "stranger", sender=OTHER), text_message("wamid.a", "me"), next_offset=4
         ),
     )
-    await until(lambda: len(meta.queues["updates"]) == 0)
-    await asyncio.sleep(0.05)
+    await until(lambda: saved_offset() == 4)
     await a.disconnect()
     assert [e.text for e in dispatched(a)] == ["me"]
+    assert PollState.load(state_path(hermes_home, API_KEY)).creator == CREATOR
+    checked = [b["message_id"] for b in meta.bodies("statuses")]
+    assert checked[:2] == ["wamid.b", "wamid.a"]  # both senders were checked with Meta
 
 
 @pytest.mark.asyncio
-async def test_allowlist_admits_listed_senders(meta, api_key, monkeypatch):
-    monkeypatch.setenv("WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS", f"{CREATOR},{OTHER}")
+async def test_creator_id_change_is_reconfirmed(meta, api_key, hermes_home):
+    new_id = "user:50972923569999"
+    a = make_adapter()
+    assert await a.connect()
+    meta.queue("updates", updates_response(text_message("wamid.a", "old id"), next_offset=2))
+    await until(lambda: a.handle_message.await_count == 1)
+    meta.queue("updates", updates_response(text_message("wamid.c", "new id", sender=new_id), next_offset=3))
+    await until(lambda: a.handle_message.await_count == 2)
+    await a.disconnect()
+    assert PollState.load(state_path(hermes_home, API_KEY)).creator == new_id
+
+
+@pytest.mark.asyncio
+async def test_allowlist_adds_senders_without_replacing_the_creator(meta, api_key, monkeypatch, hermes_home):
+    monkeypatch.setenv("WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS", OTHER)
+    meta.not_creator_wamids.add("wamid.b")
     a = make_adapter()
     assert await a.connect()
     meta.queue(
@@ -195,6 +242,19 @@ async def test_allowlist_admits_listed_senders(meta, api_key, monkeypatch):
     )
     await until(lambda: a.handle_message.await_count == 2)
     await a.disconnect()
+    assert PollState.load(state_path(hermes_home, API_KEY)).creator == CREATOR
+
+
+@pytest.mark.asyncio
+async def test_unconfirmable_sender_is_rechecked_without_advancing(meta, api_key):
+    a = make_adapter()
+    assert await a.connect()
+    meta.queue("statuses", error_response(503, 131016))  # Meta cannot answer the creator check yet
+    msg = text_message("wamid.a", "me")
+    meta.queue("updates", updates_response(msg, next_offset=2), updates_response(msg, next_offset=2))
+    await until(lambda: a.handle_message.await_count == 1)
+    await a.disconnect()
+    assert len(meta.calls("statuses")) == 2 and saved_offset() == 2
 
 
 @pytest.mark.asyncio
@@ -219,10 +279,13 @@ async def test_unsupported_type_gets_a_text_notice(meta, api_key):
 @pytest.mark.asyncio
 async def test_handoff_failure_retries_without_advancing_then_skips(meta, api_key, hermes_home):
     a = make_adapter()
+    a._backoff_base = 0.3
     a.handle_message = AsyncMock(side_effect=RuntimeError("hermes busy"))
     assert await a.connect()
     msg = text_message("wamid.poison", "x")
     meta.queue("updates", *[updates_response(msg, next_offset=6) for _ in range(3)])
+    await until(lambda: a.handle_message.await_count == 1)
+    assert saved_offset() == 0  # not advanced past a message Hermes did not accept
     await until(lambda: a.handle_message.await_count == 3)
     await until(lambda: PollState.load(state_path(hermes_home, API_KEY)).next_offset == 6)
     await a.disconnect()
@@ -295,18 +358,19 @@ async def test_rate_limited_send_is_retried_after_retry_after(connected, meta):
 async def test_partial_split_resumes_only_the_remainder(connected, meta):
     ok = httpx.Response(200, json={"messages": [{"id": "wamid.c1"}]})
     meta.queue("messages", ok, error_response(503, 131016))
-    text = "\n".join(["x" * 4000, "y" * 4000, "z" * 100])
+    text = "\n".join(["x" * 3000, "y" * 3000, "z" * 100])
     result = await connected._send_with_retry(CREATOR, text)
-    sent = [b["text"]["body"][:1] for b in meta.bodies("messages")]
+    bodies = [b["text"]["body"] for b in meta.bodies("messages")]
     assert result.success
-    assert sent.count("x") == 1 and sent[-1] == "z"
+    # x delivered, the y+z chunk refused (503/131016), then only that chunk re-sent.
+    assert [b[:1] for b in bodies] == ["x", "y", "y"] and "z" * 100 in bodies[-1]
 
 
 @pytest.mark.asyncio
 async def test_partial_split_with_ambiguous_failure_does_not_resend_head(connected, meta):
     ok = httpx.Response(200, json={"messages": [{"id": "wamid.c1"}]})
     meta.queue("messages", ok, error_response(500, 2))
-    text = "\n".join(["x" * 4000, "y" * 4000])
+    text = "\n".join(["x" * 3000, "y" * 3000])
     result = await connected._send_with_retry(CREATOR, text)
     assert not result.success and len(meta.calls("messages")) == 2
 
@@ -327,7 +391,7 @@ async def test_self_target_resolves_to_creator_and_empty_is_noop(meta, api_key):
     a = make_adapter()
     assert await a.connect()
     missing = await a.send("self", "hi")
-    assert not missing.success and missing.error_kind == "not_found"
+    assert not missing.success and "recipient unknown" in missing.error
     a._state.creator = CREATOR
     assert (await a.send("self", "hi")).success
     assert (await a.send(CREATOR, "   ")).success
@@ -350,14 +414,14 @@ async def test_quoted_reply_to_own_message_carries_its_text(meta, api_key):
 
 # ---------------------------------------------------------------- typing / read
 @pytest.mark.asyncio
-async def test_typing_posts_in_background_and_is_throttled(meta, api_key):
+async def test_read_and_typing_on_arrival_then_refresh_is_throttled(meta, api_key):
     a = make_adapter()
     assert await a.connect()
     meta.queue("updates", updates_response(text_message("wamid.in1", "hi"), next_offset=2))
     await until(lambda: a.handle_message.await_count == 1)
+    await until(lambda: len(meta.calls("statuses")) == 1)  # sent on arrival, no send_typing needed
+    await a.send_typing(CREATOR)  # within 20 s of the last status: no new request
     await a.send_typing(CREATOR)
-    await a.send_typing(CREATOR)
-    await until(lambda: len(meta.calls("statuses")) == 1)
     await asyncio.sleep(0.05)
     await a.disconnect()
     assert meta.bodies("statuses") == [
@@ -371,16 +435,31 @@ async def test_typing_posts_in_background_and_is_throttled(meta, api_key):
 
 
 @pytest.mark.asyncio
-async def test_typing_disabled_still_sends_one_read_receipt(meta, api_key):
+async def test_typing_disabled_still_sends_read_receipts(meta, api_key):
+    # Hermes never calls send_typing when typing_indicator is off: receipts must not depend on it.
     a = make_adapter()
     a.config.typing_indicator = False
     assert await a.connect()
     meta.queue("updates", updates_response(text_message("wamid.in1", "hi"), next_offset=2))
     await until(lambda: a.handle_message.await_count == 1)
-    await a.send_typing(CREATOR)
-    await until(lambda: len(meta.calls("statuses")) == 1)
+    meta.queue("updates", updates_response(text_message("wamid.in2", "again"), next_offset=3))
+    await until(lambda: len(meta.calls("statuses")) == 2)
     await a.disconnect()
-    assert "typing_indicator" not in meta.bodies("statuses")[0]
+    bodies = meta.bodies("statuses")
+    assert [b["message_id"] for b in bodies] == ["wamid.in1", "wamid.in2"]
+    assert all("typing_indicator" not in b for b in bodies)
+
+
+@pytest.mark.asyncio
+async def test_known_creator_gets_read_receipt_with_typing(meta, api_key):
+    a = make_adapter()
+    assert await a.connect()
+    meta.queue("updates", updates_response(text_message("wamid.in1", "hi"), next_offset=2))
+    await until(lambda: a.handle_message.await_count == 1)
+    meta.queue("updates", updates_response(text_message("wamid.in2", "again"), next_offset=3))
+    await until(lambda: len(meta.calls("statuses")) == 2)
+    await a.disconnect()
+    assert meta.bodies("statuses")[1]["typing_indicator"] == {"type": "text"}
 
 
 # ---------------------------------------------------------------- registration / cron

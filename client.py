@@ -8,8 +8,9 @@ Error classification follows the manual's delivery semantics:
 * ``NotSent``   — the request certainly did not take effect (connect failure,
   4xx, 429, 503/131016). Safe to retry when ``retryable``.
 * ``Ambiguous`` — it may or may not have taken effect (HTTP 500, connection
-  reset or read timeout after the request was written). Never auto-retry a
-  send in this state: a retry can deliver the message twice.
+  reset or read timeout after the request was written). The client never
+  retries these itself; the adapter reports them to Hermes, whose delivery
+  ledger re-sends the reply later with a "may be a duplicate" marker.
 """
 
 from __future__ import annotations
@@ -41,7 +42,9 @@ CODE_MEDIA_REJECTED = 131053
 CODE_POLL_REPLACED = 1752041
 
 # Per agent, rolling 60 s, counted per method.
-RATE_LIMITS = {"messages": 12, "statuses": 12, "updates": 15, "media": 12}
+# ``updates`` keeps one poll of headroom under Meta's 15/min: local stamps are taken before
+# network latency, and a new adapter starts with an empty window while Meta's does not.
+RATE_LIMITS = {"messages": 12, "statuses": 12, "updates": 14}
 
 
 class AgentPlatformError(Exception):
@@ -160,9 +163,9 @@ class RateWindow:
                 await asyncio.sleep(wait)
 
     def penalize(self, seconds: float) -> None:
-        """After a server 429, treat the window as full for ``seconds``."""
+        """After a server 429, treat the window as full for ``seconds`` (at most one window)."""
         now = self._clock()
-        fill_at = now - self.window + max(0.0, seconds)
+        fill_at = now - self.window + min(self.window, max(0.0, seconds))
         self._stamps = collections.deque([fill_at] * self.limit)
 
 
@@ -209,7 +212,7 @@ def classify_response(response: httpx.Response, action: str) -> AgentPlatformErr
         # On /updates the only parameters are integers; a code-100 400 is the token.
         return AuthError(f"{action}: API key rejected", **kw)
     if status == 403 or code == CODE_NOT_CREATOR:
-        return NotCreatorError(f"{action}: recipient is not the agent's creator", **kw)
+        return NotCreatorError(f"{action}: forbidden, not the agent's creator", **kw)
     if status == 409 or code == CODE_POLL_REPLACED:
         return PollConflict(f"{action}: a newer poll for this agent replaced this one", **kw)
     if status == 429 or code == CODE_RATE_LIMITED:
@@ -262,10 +265,14 @@ class AgentPlatformClient:
             if write:
                 raise Ambiguous(f"{action}: timed out, outcome unknown ({type(exc).__name__})") from None
             raise Retryable(f"{action}: timed out ({type(exc).__name__})") from None
-        except httpx.TransportError as exc:
+        except httpx.HTTPError as exc:  # transport resets, decoding errors after the request was sent
             if write:
                 raise Ambiguous(f"{action}: connection lost, outcome unknown ({type(exc).__name__})") from None
             raise Retryable(f"{action}: connection lost ({type(exc).__name__})") from None
+        except RuntimeError:
+            if self._http.is_closed:  # disconnect() closed the client while this call waited
+                raise Retryable(f"{action}: client closed") from None
+            raise
         if response.status_code >= 400:
             raise classify_response(response, action)
         return response
@@ -305,7 +312,7 @@ class AgentPlatformClient:
                 timeout=httpx.Timeout(self._send_timeout, connect=10.0),
             )
         except RateLimited as exc:
-            self.limits["messages"].penalize(exc.retry_after or 10.0)
+            self.limits["messages"].penalize(10.0 if exc.retry_after is None else exc.retry_after)
             raise
         try:
             message_id = response.json()["messages"][0]["id"]

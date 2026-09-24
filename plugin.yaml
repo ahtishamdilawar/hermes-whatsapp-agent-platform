@@ -21,7 +21,7 @@ optional_env:
     description: "Cron/send_message default recipient: 'self' (the agent's creator, default) or user:<id>"
     password: false
   - name: WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS
-    description: "Comma-separated user:<id> senders to accept (default: only the agent's creator)"
+    description: "Extra comma-separated user:<id> senders to accept besides the agent's creator"
     password: false
   - name: WHATSAPP_AGENT_PLATFORM_ALLOW_ALL_USERS
     description: "true to accept any sender Meta delivers (not recommended)"

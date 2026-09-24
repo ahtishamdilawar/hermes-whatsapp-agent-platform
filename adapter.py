@@ -4,6 +4,10 @@ WhatsApp → Meta ``GET /agent/v1/updates`` (long poll) → Hermes session/agent
 ``POST /agent/v1/messages`` → WhatsApp. No webhook, business number or WhatsApp Web
 session is involved; this is distinct from the ``whatsapp`` (Baileys) and
 ``whatsapp_cloud`` (Business Cloud API) transports.
+
+Delivery is at-least-once: a send whose outcome Meta leaves ambiguous (HTTP 500, a
+timeout after the request was written) is not retried inline, and Hermes's delivery
+ledger re-sends the reply later with a "may be a duplicate" marker.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms._shared import env_is_connected, get_scoped_secret, seed_extra_from_env, send_error
@@ -26,12 +31,12 @@ from hermes_constants import get_hermes_home
 
 from .client import (
     API_BASE,
+    CODE_BAD_FIELD,
+    CODE_INVALID_PARAMETER,
     MAX_TEXT_LENGTH,
     AgentPlatformClient,
     AgentPlatformError,
-    Ambiguous,
     AuthError,
-    MalformedResponse,
     NotCreatorError,
     NotSent,
     PollConflict,
@@ -50,18 +55,29 @@ KEY_ENV = "WHATSAPP_AGENT_PLATFORM_API_KEY"
 HOME_ENV = "WHATSAPP_AGENT_PLATFORM_HOME_CHANNEL"
 ALLOWED_ENV = "WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS"
 ALLOW_ALL_ENV = "WHATSAPP_AGENT_PLATFORM_ALLOW_ALL_USERS"
-BASE_URL_ENV = "WHATSAPP_AGENT_PLATFORM_BASE_URL"  # testing against a fake server only
+BASE_URL_ENV = "WHATSAPP_AGENT_PLATFORM_BASE_URL"  # development only: point at a fake API
 SELF_TARGET = "self"
 
 _USER_ID_RE = re.compile(r"^user:\S+$")
 _TRUTHY = {"1", "true", "yes", "on"}
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
-POLL_TIMEOUT = 20  # seconds; Meta allows 0–25
-POLL_MIN_INTERVAL = 60.0 / 15  # 15 polls/min per agent
+POLL_TIMEOUT = 20  # seconds; Meta allows 0-25
+POLL_MIN_INTERVAL = 60.0 / 14  # one poll of headroom under Meta's 15/min
+CHUNK_LIMIT = 4000  # split target (UTF-16 units), leaving margin under Meta's 4096
 TYPING_REFRESH = 20.0  # Meta's indicator lasts 25 s
+REPLY_QUIET = 3.0  # no typing refresh right after a reply (it would re-show the indicator)
 INTERIM_SEND_RESERVE = 4  # keep this many /messages slots for the final answer
 HANDOFF_ATTEMPTS = 3  # redeliveries of one message to Hermes before skipping it
+CLOCK_SKEW = 120  # seconds of tolerance when comparing Meta timestamps with the local clock
+CONFLICT_BACKOFF = 60.0  # after a 409, let the other poller finish before polling again
+CONFLICT_LIMIT, CONFLICT_WINDOW = 3, 600.0  # this many 409s in the window = a real second poller
+SAVE_FAILURE_LIMIT = 5  # consecutive state-save failures before the platform gives up
 UNSUPPORTED_NOTICE = "I can only read text messages on this channel for now — please send your request as text."
+
+
+class HandoffError(Exception):
+    """Hermes raised while accepting an inbound message (the offset is not advanced)."""
 
 
 def _api_key() -> str:
@@ -69,7 +85,17 @@ def _api_key() -> str:
 
 
 def _base_url() -> str:
-    return str(get_scoped_secret(BASE_URL_ENV, "") or "").strip() or API_BASE
+    """API base URL. The override exists for testing against a local fake API only: it must be
+    HTTPS, or plain HTTP on localhost, because the API key is sent with every request."""
+    override = str(get_scoped_secret(BASE_URL_ENV, "") or "").strip()
+    if not override:
+        return API_BASE
+    parts = urlsplit(override)
+    if parts.scheme == "https" or (parts.scheme == "http" and (parts.hostname or "") in _LOCAL_HOSTS):
+        logger.warning("%s: %s is set; sending the API key to %s instead of Meta", LABEL, BASE_URL_ENV, parts.hostname)
+        return override
+    logger.error("%s: ignoring %s (must be https:// or http://localhost)", LABEL, BASE_URL_ENV)
+    return API_BASE
 
 
 def _csv_env(name: str) -> set[str]:
@@ -77,11 +103,37 @@ def _csv_env(name: str) -> set[str]:
     return {part.strip() for part in raw.split(",") if part.strip()}
 
 
+def _id_hint(user_id: str) -> str:
+    """Log-safe hint for a participant id (the manual says ids must never be shown to users)."""
+    return f"…{user_id[-4:]}"
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _hard_split(chunk: str) -> list[str]:
+    if _utf16_len(chunk) <= MAX_TEXT_LENGTH:
+        return [chunk]
+    parts, current, width = [], [], 0
+    for char in chunk:
+        w = 2 if ord(char) > 0xFFFF else 1
+        if width + w > MAX_TEXT_LENGTH:
+            parts.append("".join(current))
+            current, width = [], 0
+        current.append(char)
+        width += w
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
 def _chunks(text: str) -> list[str]:
-    """Split with Hermes's fence-aware splitter, then hard-cap at Meta's 4096 chars."""
+    """Hermes's fence-aware splitter (counting UTF-16 units, as WhatsApp does for emoji),
+    then a hard cap at Meta's 4096."""
     out: list[str] = []
-    for chunk in BasePlatformAdapter.truncate_message(text, MAX_TEXT_LENGTH):
-        out.extend(chunk[i : i + MAX_TEXT_LENGTH] for i in range(0, len(chunk), MAX_TEXT_LENGTH))
+    for chunk in BasePlatformAdapter.truncate_message(text, CHUNK_LIMIT, len_fn=_utf16_len):
+        out.extend(_hard_split(chunk))
     return [c for c in out if c.strip()]
 
 
@@ -108,12 +160,17 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         self._background: set[asyncio.Task] = set()
         self._latest_inbound: collections.OrderedDict[str, str] = collections.OrderedDict()
         self._status_at: collections.OrderedDict[str, float] = collections.OrderedDict()
+        self._reply_sent_at: dict[str, float] = {}
         self._names: dict[str, str] = {}
         self._handoff_failures: dict[str, int] = {}
+        self._non_creators: set[str] = set()  # senders Meta confirmed are not the creator
+        self._conflicts: collections.deque[float] = collections.deque()
+        self._save_failures = 0
         self._last_poll_at = 0.0
         self._poll_timeout = POLL_TIMEOUT
         self._poll_min_interval = POLL_MIN_INTERVAL
         self._backoff_base = 2.0
+        self._conflict_backoff = CONFLICT_BACKOFF
 
     @property
     def name(self) -> str:
@@ -121,11 +178,14 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
 
     @property
     def authorization_is_upstream(self) -> bool:
-        """Meta delivers only the agent creator's messages and rejects sends to anyone
-        else (403/131005). The adapter additionally pins the creator on first contact and
-        drops other senders unless ``WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS`` /
-        ``..._ALLOW_ALL_USERS`` admit them, so this stays safe if Meta widens access."""
+        """The adapter authorizes every sender itself before dispatch: the agent's creator is
+        confirmed with Meta (``POST /statuses`` succeeds only for the creator's messages and
+        returns 403/131005 otherwise), and anyone else needs
+        ``WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS`` or ``..._ALLOW_ALL_USERS``."""
         return True
+
+    def _typing_enabled(self) -> bool:
+        return bool(getattr(self.config, "typing_indicator", True))
 
     # ------------------------------------------------------------------ lifecycle
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -141,7 +201,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
                 self._set_fatal_error(
                     f"{PLATFORM_NAME}_lock",
                     "This agent API key is already polling in this gateway process",
-                    retryable=False,
+                    retryable=True,
                 )
                 return False
             self._active_keys.add(fingerprint)
@@ -150,7 +210,11 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             self._release_guard()
             return False
 
-        self._state = PollState.load(state_path(get_hermes_home(), key))
+        try:
+            self._state = PollState.load(state_path(get_hermes_home(), key))
+        except OSError as exc:
+            await self._fail_connect("state_unreadable", f"cannot read polling state ({type(exc).__name__})", True)
+            return False
         self._client = AgentPlatformClient(key, base_url=_base_url())
         logger.info("%s: connecting (profile state %s)", LABEL, self._state.path.name)
         try:
@@ -163,7 +227,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             await self._fail_connect("invalid_auth", f"API key rejected by Meta ({exc.describe()})", False)
             return False
         except OSError as exc:
-            await self._fail_connect("state_unwritable", f"cannot write polling state ({exc})", False)
+            await self._fail_connect("state_unwritable", f"cannot write polling state ({type(exc).__name__})", True)
             return False
         except AgentPlatformError as exc:
             await self._fail_connect("api_unavailable", exc.describe(), True)
@@ -227,42 +291,63 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             except AuthError as exc:
                 await self._stop_polling("invalid_auth", f"API key rejected by Meta ({exc.describe()})")
                 return
-            except PollConflict:
-                await self._stop_polling(
-                    "poll_conflict",
-                    "another client started polling this agent's API key (HTTP 409); only one "
-                    "poller per key is allowed — stop the other client, then restart the gateway",
+            except PollConflict as exc:
+                if self._record_conflict():
+                    await self._stop_polling(
+                        "poll_conflict",
+                        "another client keeps polling this agent's API key (HTTP 409 "
+                        f"{CONFLICT_LIMIT} times in {CONFLICT_WINDOW / 60:.0f} min); only one poller per key "
+                        "is allowed — stop the other client, then restart the gateway",
+                    )
+                    return
+                logger.warning(
+                    "%s: another client polled this agent's API key (%s); resuming in %.0fs",
+                    LABEL,
+                    exc.describe(),
+                    self._conflict_backoff,
                 )
-                return
+                await asyncio.sleep(self._conflict_backoff)
             except OSError as exc:
-                await self._stop_polling("state_unwritable", f"cannot persist polling offset ({exc})")
-                return
-            except NotSent as exc:
-                if not isinstance(exc, Retryable):
-                    await self._stop_polling("api_error", exc.describe())
+                self._save_failures += 1
+                if self._save_failures >= SAVE_FAILURE_LIMIT:
+                    await self._stop_polling(
+                        "state_unwritable",
+                        f"cannot persist polling offset ({type(exc).__name__}, {self._save_failures} attempts)",
+                        retryable=True,
+                    )
                     return
                 failures = await self._backoff(exc, failures)
-            except Exception as exc:  # Ambiguous, Malformed, handoff retry, unexpected bugs
+            except Exception as exc:  # Retryable, Ambiguous, Malformed, other 4xx, handoff failures
                 failures = await self._backoff(exc, failures)
+
+    def _record_conflict(self) -> bool:
+        """Track 409s; True when they are frequent enough to mean a real second poller."""
+        now = time.monotonic()
+        self._conflicts.append(now)
+        while self._conflicts and now - self._conflicts[0] > CONFLICT_WINDOW:
+            self._conflicts.popleft()
+        return len(self._conflicts) >= CONFLICT_LIMIT
 
     async def _backoff(self, exc: Exception, failures: int) -> int:
         """Sleep before the next poll; the offset is unchanged, so nothing is lost."""
         failures += 1
         delay = min(60.0, self._backoff_base * 2 ** min(failures - 1, 5))
-        if isinstance(exc, RateLimited):
-            delay = max(delay, exc.retry_after or 0.0)
-            if self._client is not None:
+        if isinstance(exc, RateLimited) and exc.retry_after is not None:
+            delay = max(delay, min(60.0, exc.retry_after))
+            if self._client is not None and exc.status == 429:
                 self._client.limits["updates"].penalize(delay)
         if isinstance(exc, AgentPlatformError):
             logger.warning("%s: poll failed (%s); retrying in %.0fs", LABEL, exc.describe(), delay)
+        elif isinstance(exc, (HandoffError, OSError)):
+            logger.warning("%s: %s; retrying in %.0fs", LABEL, type(exc).__name__, delay)
         else:
             logger.warning("%s: poll failed; retrying in %.0fs", LABEL, delay, exc_info=True)
         await asyncio.sleep(delay)
         return failures
 
-    async def _stop_polling(self, code: str, message: str) -> None:
+    async def _stop_polling(self, code: str, message: str, *, retryable: bool = False) -> None:
         logger.error("%s: polling stopped: %s", LABEL, message)
-        self._set_fatal_error(code, f"{LABEL}: {message}", retryable=False)
+        self._set_fatal_error(code, f"{LABEL}: {message}", retryable=retryable)
         await self._notify_fatal_error()
 
     async def _process(self, updates: Updates) -> None:
@@ -283,23 +368,51 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             logger.warning("%s: next_offset went backwards; using Meta's value unchanged", LABEL)
         state.next_offset = updates.next_offset
         state.save()
+        self._save_failures = 0
         if handed:
             logger.info("%s: handed %d message(s) to Hermes", LABEL, handed)
 
-    def _sender_allowed(self, sender: str) -> bool:
+    async def _authorize(self, sender: str, wamid: str) -> bool:
+        """True when ``sender`` may talk to Hermes. Raises ``AgentPlatformError`` when Meta
+        cannot answer right now; the message is then re-checked on the next poll."""
         state = self._state
-        assert state is not None
-        if state.creator is None:
-            # Trust on first use: Meta only delivers the creator's messages. Also the
-            # recipient for the ``self`` target (cron / send_message).
-            state.creator = sender
-            logger.info("%s: recorded the agent creator", LABEL)
+        client = self._client
+        assert state is not None and client is not None
+        if sender == state.creator:
+            return True
+        if sender not in self._non_creators:
+            # Meta accepts a read receipt only for the creator's own messages (403/131005
+            # otherwise), which makes it an authoritative creator check. The receipt (with the
+            # typing indicator when enabled) is wanted for the creator anyway.
+            try:
+                await client.mark_read(wamid, typing=self._typing_enabled())
+            except NotCreatorError:
+                self._non_creators.add(sender)
+            except NotSent as exc:
+                if isinstance(exc, Retryable):
+                    raise  # transient: re-check on the next poll
+                # A permanent rejection is not a confirmation: treat the sender as unverified.
+                logger.warning("%s: could not confirm a sender with Meta (%s)", LABEL, exc.describe())
+            else:
+                self._note_status(wamid)
+                previous, state.creator = state.creator, sender
+                if previous is None:
+                    logger.info("%s: agent creator confirmed by Meta", LABEL)
+                else:
+                    logger.warning("%s: the creator's WhatsApp id changed (confirmed by Meta)", LABEL)
+                return True
         if str(get_scoped_secret(ALLOW_ALL_ENV, "") or "").strip().lower() in _TRUTHY:
             return True
-        allowed = _csv_env(ALLOWED_ENV)
-        if allowed:
-            return sender in allowed
-        return sender == state.creator
+        if sender in _csv_env(ALLOWED_ENV):
+            return True
+        logger.warning(
+            "%s: dropped a message from a sender who is not the agent's creator (id %s); add their "
+            "user id to %s to allow them",
+            LABEL,
+            _id_hint(sender),
+            ALLOWED_ENV,
+        )
+        return False
 
     async def _handle_inbound(self, message: dict[str, Any]) -> bool:
         """Dispatch one inbound message; True when handed to Hermes."""
@@ -315,10 +428,13 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             sent_at = int(message.get("timestamp"))
         except (TypeError, ValueError):
             sent_at = int(time.time())
-        if sent_at < state.start_timestamp:
+        if sent_at < state.start_timestamp - CLOCK_SKEW:
             return False  # retained backlog from before first activation
-        if not self._sender_allowed(sender):
-            logger.warning("%s: message from a non-allowed sender dropped", LABEL)
+        if mtype == "reaction":
+            logger.debug("%s: reaction received (not forwarded)", LABEL)
+            state.remember(wamid)
+            return False
+        if not await self._authorize(sender, wamid):
             state.remember(wamid)
             return False
 
@@ -326,11 +442,10 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         self._latest_inbound.move_to_end(sender)
         while len(self._latest_inbound) > 256:
             self._latest_inbound.popitem(last=False)
+        if wamid not in self._status_at:
+            self._note_status(wamid)
+            self._spawn(self._post_status(wamid, self._typing_enabled()))
 
-        if mtype == "reaction":
-            logger.debug("%s: reaction received (not forwarded)", LABEL)
-            state.remember(wamid)
-            return False
         text = (message.get("text") or {}).get("body") if mtype == "text" else None
         if not isinstance(text, str) or not text.strip():
             logger.info("%s: unsupported inbound type %r; notified sender", LABEL, mtype)
@@ -341,7 +456,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         event = self._build_event(message, sender, wamid, text, sent_at)
         try:
             await self.handle_message(event)
-        except Exception:
+        except Exception as exc:
             attempts = self._handoff_failures.get(wamid, 0) + 1
             self._handoff_failures[wamid] = attempts
             if attempts < HANDOFF_ATTEMPTS:
@@ -352,7 +467,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
                     HANDOFF_ATTEMPTS,
                     exc_info=True,
                 )
-                raise
+                raise HandoffError(type(exc).__name__) from exc
             logger.error("%s: skipping a message Hermes rejected %d times", LABEL, attempts, exc_info=True)
         self._handoff_failures.pop(wamid, None)
         state.remember(wamid)
@@ -400,17 +515,18 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to: str | None = None, metadata: Any = None) -> SendResult:
         if not content or not content.strip():
             return SendResult(success=True)
+        client = self._client
+        if client is None or client.closed:
+            # Hermes's delivery ledger redelivers this once the platform reconnects.
+            return SendResult(success=False, error="send_path_degraded", raw_response={"final": True})
         to = self._resolve_recipient(chat_id)
         if to is None:
             return SendResult(
                 success=False,
-                error="no WhatsApp recipient known yet (message the agent once first)",
-                error_kind="not_found",
+                error="recipient unknown: the agent's creator has not been confirmed yet (message the agent once)",
+                error_kind="unknown",
                 raw_response={"final": True},
             )
-        client = self._client
-        if client is None or client.closed:
-            return SendResult(success=False, error="not connected", retryable=True, error_kind="transient")
         if isinstance(metadata, dict) and metadata.get("_interim_send"):
             if client.limits["messages"].remaining() <= INTERIM_SEND_RESERVE:
                 logger.debug("%s: interim message dropped to save send budget", LABEL)
@@ -422,17 +538,23 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
     ) -> SendResult:
         client = self._client
         if client is None:
-            return SendResult(success=False, error="not connected", retryable=True, error_kind="transient")
+            return SendResult(success=False, error="send_path_degraded", raw_response={"final": True})
         ids = list(delivered)
         async with self._send_lock:  # the manual forbids concurrent sends to one recipient
             for index, chunk in enumerate(chunks):
+                quote = reply_to if index == 0 and not delivered else None
                 try:
-                    wamid = await client.send_text(
-                        to, chunk, reply_to=reply_to if index == 0 and not delivered else None
-                    )
+                    wamid = await client.send_text(to, chunk, reply_to=quote)
                 except AgentPlatformError as exc:
-                    return self._send_failure(exc, to, ids, chunks[index:])
+                    if not (quote and self._is_stale_quote(exc)):
+                        return self._send_failure(exc, to, ids, chunks[index:])
+                    # The quoted message is gone: nothing was sent, so send without the quote.
+                    try:
+                        wamid = await client.send_text(to, chunk)
+                    except AgentPlatformError as retry_exc:
+                        return self._send_failure(retry_exc, to, ids, chunks[index:])
                 ids.append(wamid)
+                self._reply_sent_at[to] = time.monotonic()
                 with contextlib.suppress(Exception):
                     from gateway import rich_sent_store
 
@@ -441,7 +563,14 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=ids[-1] if ids else None, continuation_message_ids=tuple(ids[:-1]))
 
     @staticmethod
+    def _is_stale_quote(exc: AgentPlatformError) -> bool:
+        return type(exc) is NotSent and exc.status == 400 and exc.code in (CODE_INVALID_PARAMETER, CODE_BAD_FIELD)
+
+    @staticmethod
     def _send_failure(exc: AgentPlatformError, to: str, delivered: list[str], remaining: list[str]) -> SendResult:
+        """Map a failed chunk to a ``SendResult`` Hermes's retry loop and delivery ledger
+        classify correctly (``flood_control:<s>`` for rate limits, "forbidden" for a
+        non-creator recipient, final for anything a retry cannot fix)."""
         raw: dict[str, Any] = {
             "to": to,
             "delivered": tuple(delivered),
@@ -453,11 +582,12 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         detail = exc.describe()
         logger.warning("%s: send failed: %s", LABEL, detail)
         if isinstance(exc, RateLimited):
+            wait = 10.0 if exc.retry_after is None else exc.retry_after
             return SendResult(
                 success=False,
-                error=f"rate limited: {detail}",
+                error=f"flood_control:{wait:g}",
                 raw_response=raw,
-                retry_after=exc.retry_after or 10.0,
+                retry_after=wait,
                 error_kind="rate_limited",
             )
         if isinstance(exc, Retryable):
@@ -470,16 +600,15 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
                 error_kind="transient",
             )
         raw["final"] = True
-        if isinstance(exc, (Ambiguous, MalformedResponse)):
-            # Possibly delivered: never retried, never re-sent as a plain-text fallback.
-            return SendResult(
-                success=False,
-                error=f"send timed out, outcome unknown: {detail}",
-                raw_response=raw,
-                error_kind="unknown",
-            )
-        kind = "forbidden" if isinstance(exc, (AuthError, NotCreatorError)) else "unknown"
-        return SendResult(success=False, error=detail, raw_response=raw, error_kind=kind)
+        if isinstance(exc, NotCreatorError):
+            return SendResult(success=False, error=f"forbidden: {detail}", raw_response=raw, error_kind="forbidden")
+        if isinstance(exc, AuthError):
+            return SendResult(success=False, error=f"api key rejected: {detail}", raw_response=raw)
+        if isinstance(exc, NotSent):
+            return SendResult(success=False, error=f"rejected: {detail}", raw_response=raw, error_kind="unknown")
+        # Ambiguous or a malformed 2xx: maybe delivered. Not retried inline; the delivery
+        # ledger re-sends the reply later, marked as a possible duplicate.
+        return SendResult(success=False, error=f"outcome unknown: {detail}", raw_response=raw, error_kind="unknown")
 
     def _send_retry_is_final(self, result: SendResult) -> bool:
         raw = result.raw_response
@@ -508,28 +637,37 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         with contextlib.suppress(AgentPlatformError):
             async with self._send_lock:
                 await client.send_text(to, text)
+                self._reply_sent_at[to] = time.monotonic()
 
-    async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
-        """Read receipt + typing indicator for the latest inbound message.
-
-        Called every ~2 s by the gateway and cancelled after 1.5 s, so the POST runs as a
-        background task and is refreshed only every 20 s (Meta's indicator lasts 25 s and
-        /statuses is limited to 12/min). With ``typing_indicator: false`` only a single
-        read receipt is sent.
-        """
-        to = self._resolve_recipient(chat_id)
-        wamid = self._latest_inbound.get(to) if to else None
-        if not wamid or self._client is None:
-            return
-        typing = bool(self.config.typing_indicator)
-        now = time.monotonic()
-        last = self._status_at.get(wamid)
-        if last is not None and (not typing or now - last < TYPING_REFRESH):
-            return
-        self._status_at[wamid] = now
+    # ----------------------------------------------------------- read / typing
+    def _note_status(self, wamid: str) -> None:
+        self._status_at[wamid] = time.monotonic()
+        self._status_at.move_to_end(wamid)
         while len(self._status_at) > 256:
             self._status_at.popitem(last=False)
-        self._spawn(self._post_status(wamid, typing))
+
+    async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
+        """Refresh the typing indicator while Hermes works.
+
+        The read receipt (plus the first indicator) is sent when the message arrives. Hermes
+        calls this every ~2 s and cancels each call after 1.5 s, so the POST runs as a
+        background task and is repeated only every 20 s (Meta's indicator lasts 25 s and
+        ``/statuses`` allows 12/min).
+        """
+        if not self._typing_enabled() or self._client is None:
+            return
+        to = self._resolve_recipient(chat_id)
+        wamid = self._latest_inbound.get(to) if to else None
+        if not wamid:
+            return
+        now = time.monotonic()
+        last = self._status_at.get(wamid)
+        if last is not None and now - last < TYPING_REFRESH:
+            return
+        if now - self._reply_sent_at.get(to, 0.0) < REPLY_QUIET:
+            return
+        self._note_status(wamid)
+        self._spawn(self._post_status(wamid, True))
 
     async def _post_status(self, wamid: str, typing: bool) -> None:
         client = self._client
@@ -576,24 +714,31 @@ async def _standalone_send(
 ) -> dict[str, Any]:
     """Out-of-process delivery (cron without a running gateway). The agent may message
     its creator first, so no inbound message is needed — only the creator's id, which the
-    gateway records on first contact (or pass an explicit ``user:<id>``)."""
+    gateway records once Meta confirms it (or pass an explicit ``user:<id>``)."""
     key = _api_key()
     if not key:
         return send_error(f"{KEY_ENV} is not set")
-    to = chat_id if _USER_ID_RE.match(chat_id or "") else read_creator(get_hermes_home(), key)
+    target = (chat_id or "").strip()
+    if target in (SELF_TARGET, ""):
+        to = read_creator(get_hermes_home(), key)
+    elif _USER_ID_RE.match(target):
+        to = target
+    else:
+        return send_error(f"invalid target {target!r}: use 'self' or user:<id>")
     if not to:
         return send_error(f"recipient unknown: send the agent one WhatsApp message first, or set {HOME_ENV}=user:<id>")
     text = to_whatsapp(message or "")
     if media_files:
         text += f"\n\n[{len(media_files)} attachment(s) generated; not sent from a scheduled job]"
     client = AgentPlatformClient(key, base_url=_base_url())
+    sent: list[str] = []
     try:
-        last = None
         for chunk in _chunks(text):
-            last = await client.send_text(to, chunk)
-        return {"success": True, "message_id": last}
+            sent.append(await client.send_text(to, chunk))
+        return {"success": True, "message_id": sent[-1] if sent else None}
     except AgentPlatformError as exc:
-        return send_error(exc.describe())
+        partial = f" after {len(sent)} of the message's parts were delivered" if sent else ""
+        return send_error(f"{exc.describe()}{partial}")
     finally:
         await client.aclose()
 
@@ -627,7 +772,7 @@ PLATFORM_HINT = (
     "You are chatting via Meta's WhatsApp Agent Platform with the person who created this "
     "agent. Standard markdown auto-converts to WhatsApp syntax (bold, italic, strike, monospace) "
     "— write markdown freely, bullets included. No tables — use bullets or labeled lines. Sent "
-    "messages cannot be edited or deleted, and replies over 4096 characters are split into "
+    "messages cannot be edited or deleted, and replies over 4000 characters are split into "
     "several messages (max 12 per minute), so keep answers concise. Only text can be sent here."
 )
 

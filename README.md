@@ -69,19 +69,31 @@ endpoint; the plugin also drops interim messages when the send budget runs low.)
 |---|---|---|---|
 | `WHATSAPP_AGENT_PLATFORM_API_KEY` | yes | — | Agent API key (Chat info → API key). |
 | `WHATSAPP_AGENT_PLATFORM_HOME_CHANNEL` | no | `self` | Where cron / `send_message` deliver. `self` = the agent's creator, or `user:<id>`. |
-| `WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS` | no | creator only | Comma-separated `user:<id>` senders to accept. |
+| `WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS` | no | — | Extra `user:<id>` senders to accept, comma-separated, in addition to the creator. |
 | `WHATSAPP_AGENT_PLATFORM_ALLOW_ALL_USERS` | no | `false` | Accept any sender Meta delivers (not recommended). |
 
 Disable the platform without removing the key: `gateway.platforms.whatsapp_agent_platform.enabled: false`.
-Turn off the read receipt's typing indicator: `gateway.platforms.whatsapp_agent_platform.typing_indicator: false`.
+Turn off the typing indicator (read receipts are still sent):
+`gateway.platforms.whatsapp_agent_platform.typing_indicator: false`.
+
+### Who can talk to your Hermes
+
+Only the agent's **creator** by default. The plugin confirms the creator with Meta before handing any message to
+Hermes (Meta accepts a read receipt only for the creator's own messages), so a message from anyone else is
+dropped and logged. If the creator's WhatsApp id changes (for example after a phone-number change), Meta's
+confirmation re-pins the new id automatically.
+
+Other senders can be admitted with `WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS`, but note that Meta currently lets an
+agent send only to its creator, so replies to anyone else are refused by Meta. The creator's `user:<id>` is
+stored as `creator` in the state file (see *Security and privacy*).
 
 ## Features
 
 | Feature | Status |
 |---|---|
-| Text messages in and out, WhatsApp formatting, replies over 4096 characters split in order | ✅ |
+| Text messages in and out, WhatsApp formatting, long replies split in order (≤ 4000 characters each) | ✅ |
 | Quoted replies (both directions) | ✅ |
-| Read receipt + typing indicator while Hermes works | ✅ |
+| Read receipt on arrival + typing indicator while Hermes works | ✅ |
 | Typed slash commands (`/new`, `/help`, …) | ✅ |
 | Cron jobs / proactive messages to the creator (`deliver: whatsapp_agent_platform`) | ✅ |
 | Images, documents, voice notes | Planned — the plugin currently replies asking for text |
@@ -90,31 +102,40 @@ Turn off the read receipt's typing indicator: `gateway.platforms.whatsapp_agent_
 ## Limits and delivery guarantees
 
 - Meta allows **12 messages, 12 status updates and 15 polls per minute** per agent. The plugin paces itself to
-  stay inside these budgets.
-- **One poller per API key.** A second client polling the same key receives HTTP 409 and the plugin stops with
-  a clear error; use a separate agent (you can create up to five) for development.
-- A send that fails with an ambiguous result (HTTP 500 or a timeout) is **never retried**, because Meta may
-  already have delivered it. Rate-limited or not-accepted sends are retried after backing off.
+  stay inside these budgets (it polls at most 14 times a minute).
+- **One poller per API key.** When another client starts polling the same key, Meta answers the plugin's
+  running poll with HTTP 409. The plugin pauses for a minute and resumes; if it keeps happening (3 times in
+  10 minutes) it stops with a clear `poll_conflict` error. Use a separate agent for development — Meta's
+  [terms](https://www.whatsapp.com/legal/third-party-agents-terms) allow up to five per account.
+- **Delivery is at-least-once.** Sends Meta refused (rate limit, "not accepted") are retried after backing off;
+  a split reply resumes with only the parts not yet sent. A send whose outcome is unknown (HTTP 500 or a timeout
+  after the request went out) is not retried immediately; Hermes's delivery ledger re-sends the reply later,
+  marked "may be a duplicate". With `gateway.delivery_ledger: false` such a reply is not re-sent.
 - On first start, messages Meta retained from before activation are skipped; after that, messages that arrive
   while the gateway is down are processed when it comes back.
+- Regenerating the API key (reinstalling WhatsApp does this) starts fresh state for the new key: the creator is
+  confirmed again and older retained messages are skipped.
 
 ## Security and privacy
 
 - Network traffic goes only to `api.whatsapp.com`. No telemetry, no self-updating code.
+  (`WHATSAPP_AGENT_PLATFORM_BASE_URL` exists only for testing against a local fake API; it accepts HTTPS or
+  `http://localhost` and logs a warning when set.)
 - The API key stays in your Hermes `.env`; it is never logged or written to plugin state.
 - State is kept in `$HERMES_HOME/platforms/whatsapp_agent_platform/<key-fingerprint>.json`: the poll cursor,
   first-activation time, recently handled message ids and the creator's `user:<id>`.
-- Per Meta's terms, agent chats are **not end-to-end encrypted**: messages pass through Meta to your Hermes
-  instance.
+- Per WhatsApp's [Third-Party Agents Terms](https://www.whatsapp.com/legal/third-party-agents-terms), agent chats are **not end-to-end encrypted**: messages
+  pass through Meta to your Hermes instance.
 
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
 | `invalid_auth` | The key is wrong or was regenerated (reinstalling WhatsApp regenerates it). Copy it again. |
-| `poll_conflict` (HTTP 409) | Another process polls the same key. Stop it, then restart the gateway. |
+| `poll_conflict` (HTTP 409) | Another process keeps polling the same key (for example a second gateway or a test script). Stop it, then restart the gateway. |
+| "dropped a message from a sender who is not the agent's creator" | Meta says that sender is not this agent's creator. Add their `user:<id>` to `WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS` only if you really want them to reach Hermes. |
 | `whatsapp_agent_platform_lock` | Another gateway on this machine already uses this key. |
-| Cron says the recipient is unknown | Send the agent one message first so the plugin learns the creator, or set `WHATSAPP_AGENT_PLATFORM_HOME_CHANNEL=user:<id>`. |
+| Cron says the recipient is unknown | Send the agent one message first so the plugin can confirm the creator, or set `WHATSAPP_AGENT_PLATFORM_HOME_CHANNEL=user:<id>`. |
 | Plugin not listed | `hermes plugins enable whatsapp-agent-platform`, and check `hermes --version` ≥ 0.21.4. |
 
 ## Development
@@ -135,4 +156,5 @@ from Meta's developer manual.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). `formatting.py` is adapted from Hermes Agent (MIT, © Nous Research).
+MIT — see [LICENSE](LICENSE). `formatting.py` is adapted from Hermes Agent (MIT, © Nous Research); its header
+carries the original notice.
