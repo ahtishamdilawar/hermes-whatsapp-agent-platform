@@ -53,15 +53,24 @@ jobs:
       matrix:
         hermes-ref: [main, v2026.9.21]
     steps:
+      # Separate directories so the plugin checks never scan the Hermes tree.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: plugin
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes-ref }}
+          path: hermes-agent
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
-      # Bare install, no extras: the same environment the plugin-catalog admission CI uses.
-      - run: pip install "git+https://github.com/NousResearch/hermes-agent@${{ matrix.hermes-ref }}"
-      - run: hermes plugins validate .
-      - run: hermes plugins compat .
-      - run: hermes plugins doctor . --ci
+      # Bare editable install, no extras: the environment the plugin-catalog admission CI uses
+      # (Hermes refuses wheel builds, so `pip install git+...` is not an option).
+      - run: pip install -e ./hermes-agent
+      - run: hermes plugins validate plugin
+      - run: hermes plugins compat plugin
+      - run: hermes plugins doctor plugin --ci
 
   version:
     if: startsWith(github.ref, 'refs/tags/v')
