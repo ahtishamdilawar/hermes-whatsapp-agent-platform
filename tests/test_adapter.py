@@ -396,6 +396,17 @@ def test_register_declares_platform_capabilities():
     assert captured["required_env"] == ["WHATSAPP_AGENT_PLATFORM_API_KEY"]
     assert captured["cron_deliver_env_var"] == "WHATSAPP_AGENT_PLATFORM_HOME_CHANNEL"
     assert captured["max_message_length"] == 4096 and captured["pii_safe"] is True
+    import hermes_cli.gateway as gateway_mod
+    from gateway.config import PlatformConfig
+
+    real_get = gateway_mod.get_env_value
+    try:  # status reads through the .env-backed helper, not only os.environ
+        gateway_mod.get_env_value = lambda name: "k" if name == "WHATSAPP_AGENT_PLATFORM_API_KEY" else ""
+        assert captured["is_connected"](PlatformConfig(enabled=True)) is True
+        gateway_mod.get_env_value = lambda name: ""
+        assert captured["is_connected"](PlatformConfig(enabled=True)) is False
+    finally:
+        gateway_mod.get_env_value = real_get
     for hook in ("standalone_sender_fn", "parse_target_ref_fn", "env_enablement_fn", "setup_fn"):
         assert callable(captured[hook])
     # The hint must ask for markdown: WhatsApp-style *bold* from the model would be converted to italics.

@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms._shared import get_scoped_secret, seed_extra_from_env, send_error
+from gateway.platforms._shared import env_is_connected, get_scoped_secret, seed_extra_from_env, send_error
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from hermes_constants import get_hermes_home
@@ -639,7 +639,9 @@ def register(ctx: Any) -> None:
         adapter_factory=WhatsAppAgentPlatformAdapter,
         check_fn=lambda: True,  # only needs httpx, a core Hermes dependency
         validate_config=_has_key,
-        is_connected=_has_key,
+        # .env-backed and profile-aware, so `hermes gateway setup` / `hermes status` see a key
+        # stored in .env even when it is not exported into the process environment.
+        is_connected=env_is_connected(KEY_ENV),
         required_env=[KEY_ENV],
         install_hint=f"Set {KEY_ENV} (WhatsApp → agent chat → Chat info → API key)",
         setup_fn=_interactive_setup,
