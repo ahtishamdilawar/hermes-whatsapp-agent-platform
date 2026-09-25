@@ -30,13 +30,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        hermes-ref: [main, v2026.9.21] # v2026.9.21 = Hermes 0.21.4, the requires_hermes floor
-        python: ["3.11", "3.12", "3.13"]
+        # v2026.9.21 = Hermes 0.21.4, the requires_hermes floor (Python 3.11-3.13).
+        # Hermes main installs its core dependencies only on Python 3.14.
         include:
-          - os: windows-latest
-            hermes-ref: main
-            python: "3.12"
+          - { os: ubuntu-latest, hermes-ref: v2026.9.21, python: "3.11" }
+          - { os: ubuntu-latest, hermes-ref: v2026.9.21, python: "3.12" }
+          - { os: ubuntu-latest, hermes-ref: v2026.9.21, python: "3.13" }
+          - { os: ubuntu-latest, hermes-ref: main, python: "3.14" }
+          - { os: windows-latest, hermes-ref: main, python: "3.14" }
     steps:
       # Plugin and Hermes side by side, as after `hermes plugins install` (never Hermes inside the plugin).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -60,7 +61,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        hermes-ref: [main, v2026.9.21]
+        include:
+          - { hermes-ref: v2026.9.21, python: "3.11" }
+          - { hermes-ref: main, python: "3.14" }
     steps:
       # Separate directories so the plugin checks never scan the Hermes tree.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -73,7 +76,7 @@ jobs:
           path: hermes-agent
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
       # Bare editable install, no extras: the environment the plugin-catalog admission CI uses
       # (Hermes refuses wheel builds, so `pip install git+...` is not an option).
       - run: pip install -e ./hermes-agent

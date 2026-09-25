@@ -143,7 +143,7 @@ stored as `creator` in the state file (see *Security and privacy*).
 ```bash
 git clone https://github.com/NousResearch/hermes-agent
 git clone https://github.com/ahtishamdilawar/hermes-whatsapp-agent-platform
-python -m venv .venv && . .venv/bin/activate      # Python 3.11–3.13
+python -m venv .venv && . .venv/bin/activate      # Python 3.14 (3.11–3.13 for Hermes <= 0.21.4)
 pip install -e ./hermes-agent "pytest==9.1.1" "pytest-asyncio==1.3.0"
 cd hermes-whatsapp-agent-platform
 pytest                                             # protocol, adapter and real-loader tests (fake Meta API)

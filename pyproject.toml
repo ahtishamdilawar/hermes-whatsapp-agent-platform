@@ -6,7 +6,7 @@ name = "hermes-whatsapp-agent-platform"
 version = "0.1.0"
 description = "Meta WhatsApp Agent Platform adapter for Hermes Agent"
 license = "MIT"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]

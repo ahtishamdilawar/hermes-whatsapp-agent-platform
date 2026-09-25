@@ -5,6 +5,10 @@ All notable changes to this plugin are documented here. Versions follow [SemVer]
 
 ## [Unreleased]
 
+### Fixed
+- `requires-python` no longer excludes Python 3.14. Hermes `main` runs only on 3.14 and refuses (or, on update,
+  disables) a plugin whose `requires-python` does not include the interpreter it runs on.
+
 ## [0.1.0] - 2026-09-24
 
 ### Added
