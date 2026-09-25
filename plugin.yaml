@@ -1,7 +1,7 @@
 name: whatsapp-agent-platform
 label: WhatsApp Agent Platform
 kind: platform
-version: 0.1.0
+version: 0.1.1
 description: >-
   Chat with Hermes from a WhatsApp Agent via Meta's WhatsApp Agent Platform (long-poll
   /agent/v1 API; no webhook, business number or WhatsApp Web session). Community plugin,
