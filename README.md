@@ -29,9 +29,15 @@ WhatsApp ──► Meta Agent Platform ──GET /updates (long poll)──► H
 
 ## Install
 
+The plugin is in the [official Hermes plugin catalog](https://github.com/NousResearch/hermes-agent/tree/main/plugin-catalog),
+so install it by name:
+
 ```bash
-hermes plugins install ahtishamdilawar/hermes-whatsapp-agent-platform --enable
+hermes plugins install whatsapp-agent-platform
 ```
+
+This installs the reviewed release pinned in the catalog, then asks whether to enable it (add `--enable` to skip
+the prompt).
 
 Then get your key: in WhatsApp go to **Settings → Agents → Create an agent**, open the agent's chat →
 **Chat info → API key**. Store it with `hermes gateway setup` (choose *WhatsApp Agent Platform*) or add it to
