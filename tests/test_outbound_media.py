@@ -26,6 +26,7 @@ from wap_helpers import (
     bad_field_response,
     caption_too_long_response,
     error_response,
+    fixture_json,
     media_type_mismatch_response,
     no_media_found_send_response,
     rate_limited_response,
@@ -466,6 +467,19 @@ async def test_rejected_quote_is_resent_without_it_with_the_same_media_id(ad, me
     assert first["context"] == {"message_id": "wamid.old"} and "context" not in second
     assert first["image"]["id"] == second["image"]["id"] and len(meta.uploads) == 1
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["send:stale_context_media_made_up_wamid", "send:stale_context_media_garbage_id"])
+async def test_live_stale_quote_errors_resend_without_the_quote(ad, meta, tmp_path, key):
+    # Shapes recorded live on 2026-09-30 (P6): a media send quoting a wamid Meta doesn't know.
+    live = fixture_json("live_media_errors.json")[key]
+    meta.queue("messages", bad_field_response(live["error_data"]["details"]))
+    result = await ad.send_image_file(CREATOR, put(tmp_path, "a.png", sample_png()), reply_to="wamid.old")
+    assert result.success
+    first, second = meta.bodies("messages")
+    assert first["context"] == {"message_id": "wamid.old"} and "context" not in second
+    assert first["image"]["id"] == second["image"]["id"] and len(meta.uploads) == 1
 
 @pytest.mark.asyncio
 async def test_upload_runs_outside_the_send_lock_and_the_message_inside(ad, meta, tmp_path):

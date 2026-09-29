@@ -192,5 +192,25 @@
       "messaging_product": "whatsapp",
       "details": "No media found for this id."
     }
+  },
+  "send:stale_context_media_made_up_wamid": {
+    "http": 400,
+    "code": 131009,
+    "type": "OAuthException",
+    "message": "(#131009) Missing or malformed required fields",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "`context.message_id` belongs to a different chat than `to`"
+    }
+  },
+  "send:stale_context_media_garbage_id": {
+    "http": 400,
+    "code": 131009,
+    "type": "OAuthException",
+    "message": "(#131009) Missing or malformed required fields",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "`context.message_id` is not a message id issued by this platform"
+    }
   }
 }
