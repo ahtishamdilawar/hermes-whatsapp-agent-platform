@@ -20,8 +20,11 @@ import io
 import math
 import os
 import re
+import threading
 import unicodedata
-from collections.abc import Callable, Iterable
+import warnings
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 # --------------------------------------------------------------------------- limits and tables
@@ -43,7 +46,11 @@ MAX_FILENAME_CHARS = 120
 MAX_FILENAME_BYTES = 200  # UTF-8; keeps Hermes's ``doc_<hex>_`` prefix plus the name under ext4's 255 bytes
 MAX_EXT_CHARS = 10
 MAX_IMAGE_PIXELS = 25_000_000  # manual: "at or below 25 megapixels"
-_MAX_DECODE_PIXELS = 100_000_000  # refuse to decode anything bigger (memory), fall back to a document
+# The most pixels ever decoded. A source above it is never decoded: a JPEG is decoded at 1/2, 1/4 or 1/8 scale
+# (libjpeg's draft mode) when that fits, anything else goes out unmodified as a file. Decoding costs about 4 bytes
+# per pixel several times over (a 99.8 MP lossless WebP of 4 KB peaked at about 1.6 GB), so 25 MP (Meta's own
+# image cap, so no image WhatsApp would accept is refused) keeps one conversion at roughly 450 MiB.
+MAX_DECODE_PIXELS = 25_000_000
 
 OCTET_STREAM = "application/octet-stream"
 TEXT_PLAIN = "text/plain"
@@ -294,7 +301,8 @@ def sha256_bytes(s: object) -> bytes | None:
 
 # --------------------------------------------------------------------------- filenames
 
-_UNSAFE_CHARS = re.compile(r"[^\w .\-()\[\]+,@=#]")  # also covers <>:"/\|?* and every other punctuation
+# Also covers <>:"/\|?*, brackets and braces (Hermes prints cache paths inside its own "[...]" notes).
+_UNSAFE_CHARS = re.compile(r"[^\w .\-()+,@=#]")
 _SPACES = re.compile(r" {2,}")
 _EXT_RE = re.compile(rf"[A-Za-z0-9]{{1,{MAX_EXT_CHARS}}}")
 _DROP_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})  # controls, bidi/format, surrogates, ...
@@ -324,11 +332,11 @@ def _split_ext(name: str) -> tuple[str, str]:
 def sanitize_filename(name: str | None, *, default_stem: str, ext: str | None = None) -> str:
     """A safe, deterministic display/upload filename.
 
-    Drops directories, control/format (incl. bidi override) characters; replaces ``<>:"/\\|?*`` and other
-    punctuation with ``_``; strips leading dots/dashes/spaces and trailing dots/spaces; prefixes Windows reserved
-    names (``CON``, ``COM1.txt``...) with ``_``; caps the name at 120 characters (and 200 UTF-8 bytes), keeping the
-    extension. ``ext`` forces the extension: a recognised media/document extension is replaced (``a.webp`` ->
-    ``a.png``), anything else is kept in the stem (``notes.v2`` -> ``notes.v2.pdf``).
+    Drops directories, control/format (incl. bidi override) characters; replaces ``<>:"/\\|?*``, ``[]{}`` and
+    other punctuation except ``()+,@=#`` with ``_``; strips leading dots/dashes/spaces and trailing dots/spaces;
+    prefixes Windows reserved names (``CON``, ``COM1.txt``...) with ``_``; caps the name at 120 characters (and
+    200 UTF-8 bytes), keeping the extension. ``ext`` forces the extension: a recognised media/document extension
+    is replaced (``a.webp`` -> ``a.png``), anything else is kept in the stem (``notes.v2`` -> ``notes.v2.pdf``).
     """
     stem, cur = _split_ext(_clean_component(name if isinstance(name, str) else ""))
     if ext is not None:
@@ -419,6 +427,38 @@ def sniff_mime(head: bytes) -> str | None:
 def webp_is_animated(head: bytes) -> bool:
     """True for an extended-format WebP with the animation flag set (needs the first 21 bytes)."""
     return len(head) > 20 and head[:4] == b"RIFF" and head[8:16] == b"WEBPVP8X" and bool(head[20] & 0x02)
+
+
+def _header_dims(head: bytes) -> tuple[int, int] | None:
+    """(width, height) from a PNG, GIF, WebP or BMP header (the first 30 bytes; nothing is decoded), else None.
+
+    JPEG, TIFF and HEIC/AVIF need a walk through the file; Pillow reads those headers under the same limit.
+    """
+    h = bytes(head[:64])
+    le = int.from_bytes
+    if h.startswith(b"\x89PNG\r\n\x1a\n") and h[12:16] == b"IHDR" and len(h) >= 24:
+        return le(h[16:20], "big"), le(h[20:24], "big")
+    if h[:6] in (b"GIF87a", b"GIF89a") and len(h) >= 10:
+        return le(h[6:8], "little"), le(h[8:10], "little")
+    if h[:4] == b"RIFF" and h[8:12] == b"WEBP" and len(h) >= 30:
+        chunk = h[12:16]
+        if chunk == b"VP8X":
+            return le(h[24:27], "little") + 1, le(h[27:30], "little") + 1
+        if chunk == b"VP8L" and h[20] == 0x2F:
+            bits = le(h[21:25], "little")
+            return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        if chunk == b"VP8 " and h[23:26] == b"\x9d\x01\x2a":
+            return le(h[26:28], "little") & 0x3FFF, le(h[28:30], "little") & 0x3FFF
+        return None
+    if h.startswith(b"BM") and len(h) >= 26:
+        if le(h[14:18], "little") == 12:  # BITMAPCOREHEADER: unsigned 16-bit
+            return le(h[18:20], "little"), le(h[20:22], "little")
+        return abs(le(h[18:22], "little", signed=True)), abs(le(h[22:26], "little", signed=True))
+    return None
+
+
+def _over_decode_limit(dims: tuple[int, int] | None) -> bool:
+    return dims is not None and dims[0] * dims[1] > MAX_DECODE_PIXELS
 
 
 _FAMILY = {
@@ -644,7 +684,12 @@ def plan_outbound(
     if force_document or requested == "document":
         return _as_document(name, mime, head, size)
 
-    if requested == "sticker" and mime == "image/webp" and size <= SEND_LIMITS["sticker"]:
+    if (
+        requested == "sticker"
+        and mime == "image/webp"
+        and size <= SEND_LIMITS["sticker"]
+        and not _over_decode_limit(_header_dims(head))
+    ):
         return OutboundPlan("sticker", "image/webp", _named(name, "image/webp", "sticker"), None, False, None, mime)
 
     family = (mime or "").split("/", 1)[0]
@@ -703,9 +748,11 @@ def _downgrade(name: str, mime: str | None, reason: str) -> OutboundPlan:
 
 def _plan_image(path: str, name: str, mime: str | None, head: bytes, size: int) -> OutboundPlan:
     original = _named(name, mime, "image")
+    if mime in _IMAGE_AS_IS and size <= SEND_LIMITS["image"]:
+        return OutboundPlan("image", mime, original, None, False, None, mime)
+    if mime != "image/jpeg" and _over_decode_limit(_header_dims(head)):
+        return _downgrade(name, mime, REASON_TOO_LARGE)  # never decoded: a decompression bomb, or simply huge
     if mime in _IMAGE_AS_IS:
-        if size <= SEND_LIMITS["image"]:
-            return OutboundPlan("image", mime, original, None, False, None, mime)
         return _convert_plan("to_jpeg", name, mime, original)
     if mime == "image/gif":
         with open(path, "rb") as fh:
@@ -782,7 +829,9 @@ def prepare_outbound(
     if plan.transform in ("to_png", "to_jpeg"):
         try:
             data, mime = _convert_image(path, plan.transform)
-        except Exception:  # ImportError (no Pillow), decode errors, bombs, oversize after the ladder
+        except _TooManyPixels:  # never decoded
+            return _fallback_document(path, plan, REASON_TOO_LARGE)
+        except Exception:  # ImportError (no Pillow), decode errors, oversize after the ladder
             reason = REASON_TOO_LARGE if plan.source_mime in _IMAGE_AS_IS else REASON_UNSUPPORTED
             return _fallback_document(path, plan, reason)
         filename = plan.filename
@@ -851,17 +900,100 @@ def _same_file(a: str, b: str) -> bool:
         return True
 
 
+class _TooManyPixels(_ConversionFailed):
+    """The source is over ``MAX_DECODE_PIXELS`` (after any JPEG draft scaling); it was not decoded."""
+
+
+# Formats the converter lets Pillow open (never Pillow's whole plugin zoo). HEIF is added only once pillow_heif's
+# opener is registered; names this Pillow build lacks (AVIF before 11.3) are skipped.
+_PILLOW_FORMATS = ("JPEG", "MPO", "PNG", "GIF", "WEBP", "BMP", "TIFF", "AVIF")
+_HEIF_MIMES = frozenset({"image/heic", "image/heif"})
+
+# Serialises conversions: one decode at a time bounds memory, and it makes the save/restore of Pillow's global
+# ``Image.MAX_IMAGE_PIXELS`` consistent. For the length of one conversion, other threads' Pillow calls see that
+# limit only tightened (never loosened), and a DecompressionBombWarning raised as an error.
+_PILLOW_LOCK = threading.Lock()
+_HEIF_LOCK = threading.Lock()
+_heif_ready: bool | None = None  # None: not tried yet
+
+
+def _heif_opener() -> bool:
+    """Register pillow_heif's HEIC/HEIF opener with Pillow, once (thread-safe). False when it is unavailable."""
+    global _heif_ready
+    with _HEIF_LOCK:
+        if _heif_ready is None:
+            try:
+                import pillow_heif  # lazy: a Hermes core dependency, not ours
+
+                pillow_heif.register_heif_opener()
+                _heif_ready = True
+            except Exception:  # ImportError, or a broken native library
+                _heif_ready = False
+        return _heif_ready
+
+
+@contextmanager
+def _pillow_limits(image_module) -> Iterator[Callable[[], None]]:
+    """Pillow's decompression-bomb guard as a hard error; yields ``tighten()`` for the decode phase.
+
+    The header is read under Pillow's current limit (so a large JPEG can still be draft-scaled); ``tighten()``
+    lowers it to ``MAX_DECODE_PIXELS`` before anything is decoded. Restored on exit. Hold ``_PILLOW_LOCK``.
+    """
+    saved = image_module.MAX_IMAGE_PIXELS
+
+    def tighten() -> None:
+        image_module.MAX_IMAGE_PIXELS = MAX_DECODE_PIXELS if saved is None else min(saved, MAX_DECODE_PIXELS)
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", image_module.DecompressionBombWarning)
+            yield tighten
+    except (image_module.DecompressionBombError, image_module.DecompressionBombWarning) as exc:
+        raise _TooManyPixels("image dimensions over the decode limit") from exc
+    finally:
+        image_module.MAX_IMAGE_PIXELS = saved
+
+
+def _draft_to_limit(src) -> None:
+    """Shrink a JPEG's decode size (1/2, 1/4, 1/8) until it fits ``MAX_DECODE_PIXELS``; raise if it cannot."""
+    width, height = src.size
+    if width * height <= MAX_DECODE_PIXELS:
+        return
+    for scale in (2, 4, 8):
+        if math.ceil(width / scale) * math.ceil(height / scale) <= MAX_DECODE_PIXELS:
+            src.draft(None, (max(1, width // scale), max(1, height // scale)))  # a no-op for non-JPEG formats
+            break
+    width, height = src.size
+    if width * height > MAX_DECODE_PIXELS:
+        raise _TooManyPixels("image dimensions over the decode limit")
+
+
 def _convert_image(path: str, transform: str) -> tuple[bytes, str]:
-    """PNG or JPEG bytes of the image, at most 25 MP and within the image limit. Raises on any failure."""
+    """PNG or JPEG bytes of the image, at most 25 MP and within the image limit. Raises on any failure.
+
+    Nothing over ``MAX_DECODE_PIXELS`` is decoded (``_TooManyPixels``): the header is checked first, by our own
+    parser where it can and then by Pillow's lazy open, and a large JPEG is decoded at a reduced scale.
+    """
+    with open(path, "rb") as fh:
+        head = fh.read(64)
+    if _over_decode_limit(_header_dims(head)):
+        raise _TooManyPixels("image dimensions over the decode limit")  # before Pillow allocates anything
+    heif = sniff_mime(head) in _HEIF_MIMES and _heif_opener()
+
     from PIL import Image, ImageOps  # lazy: Hermes core dependency, not ours
 
+    Image.init()
+    formats = [f for f in _PILLOW_FORMATS if f in Image.OPEN] + (["HEIF"] if heif and "HEIF" in Image.OPEN else [])
     limit = SEND_LIMITS["image"]
-    with Image.open(path) as src:
+    with _PILLOW_LOCK, _pillow_limits(Image) as tighten, Image.open(path, formats=formats) as src:
         width, height = src.size
-        if width <= 0 or height <= 0 or width * height > _MAX_DECODE_PIXELS:
+        if width <= 0 or height <= 0:
             raise _ConversionFailed("image dimensions out of range")
+        _draft_to_limit(src)
+        tighten()
         if getattr(src, "n_frames", 1) > 1:
             src.seek(0)
+        width, height = src.size
         if width * height > MAX_IMAGE_PIXELS:
             scale = math.sqrt(MAX_IMAGE_PIXELS / (width * height))
             src.thumbnail((max(1, int(width * scale)), max(1, int(height * scale))), Image.Resampling.LANCZOS)
@@ -914,7 +1046,30 @@ def _jpeg_ladder(image, limit: int) -> bytes:
 
 # --------------------------------------------------------------------------- outbound: denylist
 
-_DENIED_NAMES = frozenset({"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".git-credentials", ".netrc"})
+# ``auth.json`` is Hermes's provider-credential file; a dev profile's HERMES_HOME does not cover another
+# profile's (e.g. prod ``~/.hermes/auth.json``), so it is denied by name wherever it is.
+_DENIED_NAMES = frozenset({"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".git-credentials", ".netrc", "auth.json"})
+# Win32 namespace prefixes, in either slash direction: ``\\?\UNC\srv\share``, ``\\?\C:\``, ``\\.\C:\``, ``\??\C:\``.
+_WIN_UNC_PREFIX = re.compile(r"^(?:[\\/]{2}[?.]|[\\/]\?\?)[\\/]UNC[\\/]", re.IGNORECASE)
+_WIN_DEVICE_PREFIX = re.compile(r"^(?:[\\/]{2}[?.]|[\\/]\?\?)[\\/](?=[A-Za-z]:)")
+
+
+def strip_win_prefix(path: str) -> str:
+    """``\\\\?\\C:\\x`` -> ``C:\\x`` and ``\\\\?\\UNC\\srv\\share\\x`` -> ``\\\\srv\\share\\x`` (also ``//?/``,
+    ``\\\\.\\`` and ``\\??\\``). Pure string work, the same on every OS; other paths are returned unchanged.
+
+    ``realpath`` keeps these prefixes, and ``commonpath`` then treats ``\\\\?\\C:`` and ``C:`` as different drives,
+    so a prefixed path into a denied directory looked like it was outside it.
+    """
+    unc = _WIN_UNC_PREFIX.match(path)
+    if unc:
+        return "\\\\" + path[unc.end() :]
+    device = _WIN_DEVICE_PREFIX.match(path)
+    return path[device.end() :] if device else path
+
+
+def _win_path(path: str) -> str:
+    return strip_win_prefix(path) if os.name == "nt" else path  # on POSIX a backslash is an ordinary character
 
 
 def _denied_basename(name: str) -> bool:
@@ -927,18 +1082,21 @@ def is_denied_path(path: str, *, extra_dirs: Iterable[str] = ()) -> bool:
     """The plugin's narrow never-upload list (D6), on top of Hermes's own delivery policy.
 
     Denies ``.env`` / ``.env.*``, ``*.pem``, ``id_rsa`` / ``id_ed25519`` / ``id_ecdsa`` / ``id_dsa`` (not their
-    ``.pub``), ``.git-credentials``, ``.netrc``, and anything under ``extra_dirs``. Both the given name and the
-    symlink-resolved target are checked. Fails closed (True) when the path cannot be resolved.
+    ``.pub``), ``.git-credentials``, ``.netrc``, ``auth.json``, and anything under ``extra_dirs``. Both the given
+    name and the symlink-resolved target are checked, after dropping Windows ``\\\\?\\`` / ``\\\\?\\UNC\\``
+    prefixes on either side. Fails closed (True) when the path cannot be resolved. Name-based: a copy or a
+    hardlink under another name is not caught.
     """
     try:
         raw = os.fspath(path)
         if not isinstance(raw, str) or "\x00" in raw:
             return True
-        resolved = os.path.realpath(raw)
+        raw = _win_path(raw)
+        resolved = _win_path(os.path.realpath(raw))
         if _denied_basename(os.path.basename(raw)) or _denied_basename(os.path.basename(resolved)):
             return True
         target = os.path.normcase(resolved)
-        roots = [os.path.normcase(os.path.realpath(os.fspath(d))) for d in extra_dirs]
+        roots = [os.path.normcase(_win_path(os.path.realpath(_win_path(os.fspath(d))))) for d in extra_dirs]
     except (OSError, ValueError, TypeError):
         return True
     for root in roots:
