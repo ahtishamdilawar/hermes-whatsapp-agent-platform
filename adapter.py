@@ -16,10 +16,12 @@ import asyncio
 import collections
 import contextlib
 import logging
+import math
 import os
 import re
 import threading
 import time
+import traceback
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -96,9 +98,18 @@ UNSUPPORTED_TYPE_NOTICE = (
 )
 DOCUMENTED_TYPES = frozenset({"text", "reaction", *media.MEDIA_KINDS})  # the manual's seven inbound types
 MAX_REACTION_CHARS = 32
+REACTION_HOOK_TIMEOUT = 5.0  # seconds one reaction hook may hold the poll loop
 PREPARED_MEDIA_MAX = 32  # downloaded media kept per wamid, so a Hermes handoff retry doesn't download again
 STICKER_NOTE = "[The user sent a sticker]"
-_BIDI_CONTROLS = frozenset("\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+MAX_TIMESTAMP = 4_102_444_800  # 2100-01-01; later values aren't Meta's (and overflow datetime on Windows)
+_TIMESTAMP_RE = re.compile(r"[0-9]{1,12}")
+_WAMID_RE = re.compile(r"[A-Za-z0-9._=+/-]{1,128}")  # "wamid." + Base64, as in the manual's examples
+MAX_REMEMBERED_ID = 256  # longer "ids" from a malformed message are not put into the dedup window
+_ZWJ = "\u200d"
+# Invisible, bidi, control and separator characters: never passed on in a reaction emoji.
+_UNSAFE_EMOJI_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+# Subdivision flags (England, Scotland, Wales): a black flag, 2-6 tag letters/digits, then CANCEL TAG.
+_FLAG_TAG_SEQUENCE = re.compile("\U0001f3f4[\U000e0030-\U000e0039\U000e0061-\U000e007a]{2,6}\U000e007f")
 _DISPLAY_UNSAFE = re.compile(r"[^\w.\- ]")  # Hermes's rule for names shown in prompt notes
 _REFUSED_IMAGES = frozenset({"image/heic", "image/heif", "image/avif", "image/tiff"})  # the image cache refuses
 _DEFAULT_MIME = {
@@ -168,12 +179,81 @@ def _restrict_permissions(path: str) -> None:
             os.chmod(path, 0o600)
 
 
+def _emoji_part(ch: str) -> bool:
+    """A character that can sit next to a ZWJ inside an emoji sequence: a pictograph, a skin-tone modifier, a
+    variation selector, or a code point newer than this Python's Unicode tables."""
+    return ord(ch) > 0x7F and unicodedata.category(ch) in ("So", "Sk", "Mn", "Cn")
+
+
 def _clean_emoji(value: Any) -> str:
-    """A reaction emoji for hooks: control and bidi characters dropped (ZWJ kept), at most 32 characters."""
+    """A reaction emoji for hooks, at most 32 characters.
+
+    Control (C0/C1), format (zero-width, bidi, BOM, tags), surrogate and line/paragraph-separator characters are
+    dropped. Two exceptions keep real emoji intact: a ZWJ *between* two emoji parts (family, profession and flag
+    sequences) and a complete subdivision-flag tag sequence.
+    """
     if not isinstance(value, str):
         return ""
-    text = "".join(ch for ch in value if unicodedata.category(ch) != "Cc" and ch not in _BIDI_CONTROLS)
-    return text.strip()[:MAX_REACTION_CHARS]
+    value = value[: MAX_REACTION_CHARS * 8]  # bound the work; far more than any real emoji sequence
+    out: list[str] = []
+    i = 0
+    while i < len(value):
+        flag = _FLAG_TAG_SEQUENCE.match(value, i)
+        if flag is not None:
+            out.append(flag.group())
+            i = flag.end()
+            continue
+        ch = value[i]
+        if ch == _ZWJ:
+            following = value[i + 1] if i + 1 < len(value) else ""
+            if out and _emoji_part(out[-1][-1]) and following and _emoji_part(following):
+                out.append(ch)
+        elif unicodedata.category(ch) not in _UNSAFE_EMOJI_CATEGORIES:
+            out.append(ch)
+        i += 1
+    return "".join(out).strip()[:MAX_REACTION_CHARS].rstrip(_ZWJ).strip()
+
+
+def _valid_wamid(value: Any) -> bool:
+    """A message id shaped like Meta's wamids (ASCII ``wamid.`` + Base64, at most 128 characters)."""
+    return isinstance(value, str) and _WAMID_RE.fullmatch(value) is not None
+
+
+def _rememberable(value: Any) -> bool:
+    """An inbound id that may go into the dedup window, even when the rest of its message is unusable."""
+    return isinstance(value, str) and 0 < len(value) <= MAX_REMEMBERED_ID
+
+
+def _timestamp(value: Any) -> int | None:
+    """Meta's ``timestamp`` (epoch seconds, sent as a string) as an int; None when missing or out of range."""
+    if isinstance(value, str) and _TIMESTAMP_RE.fullmatch(value.strip()):
+        seconds = int(value.strip())
+    elif isinstance(value, int) and not isinstance(value, bool):
+        seconds = value
+    elif isinstance(value, float) and math.isfinite(value):
+        seconds = int(value)
+    else:
+        return None
+    return seconds if 0 < seconds <= MAX_TIMESTAMP else None
+
+
+def _text_body(message: dict[str, Any]) -> str | None:
+    """The body of a ``text`` message; None when ``text`` isn't an object or its body isn't a string."""
+    text = message.get("text")
+    body = text.get("body") if isinstance(text, dict) else None
+    return body if isinstance(body, str) else None
+
+
+def _discard(path: str) -> None:
+    """Remove a cached file whose message then failed, so nothing unreferenced stays in Hermes's cache."""
+    with contextlib.suppress(OSError):
+        os.remove(path)
+
+
+def _where(exc: BaseException) -> str:
+    """``file:line`` of the innermost frame, for logs that must not quote the exception's text."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    return f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}" if frames else "?"
 
 
 def _media_label(kind: str, *, voice: bool = False, filename: str | None = None) -> str:
@@ -270,6 +350,8 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         self._conflict_backoff = CONFLICT_BACKOFF
         self._media_enabled = _media_enabled(config)
         self._media_timeout: float | None = None  # None = media_inbound.FETCH_DEADLINE; tests shrink it
+        self._media_retry_wait: float | None = None  # None = media_inbound.RETRY_WAIT_CAP; tests set 0
+        self._hook_timeout = REACTION_HOOK_TIMEOUT
         self._prepared_media: collections.OrderedDict[str, _InboundMedia] = collections.OrderedDict()
 
     @property
@@ -462,8 +544,13 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
                 self._names[wa_id] = profile["name"]
         handed = 0
         for message in updates.messages:
-            if await self._handle_inbound(message):
-                handed += 1
+            try:
+                if await self._handle_inbound(message):
+                    handed += 1
+            except (HandoffError, AgentPlatformError, OSError):
+                raise  # Hermes busy, Meta can't confirm a sender yet, state unwritable: re-poll the page
+            except Exception as exc:  # a message we can't parse must not block the page forever
+                self._skip_unhandled(message, exc)
         if updates.next_offset < state.next_offset:
             logger.warning("%s: next_offset went backwards; using Meta's value unchanged", LABEL)
         state.next_offset = updates.next_offset
@@ -519,14 +606,16 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         state = self._state
         assert state is not None
         wamid, sender, mtype = message.get("id"), message.get("from"), message.get("type")
-        if not isinstance(wamid, str) or not isinstance(sender, str) or not _USER_ID_RE.match(sender):
-            logger.warning("%s: malformed inbound message skipped", LABEL)
-            return False
+        if not isinstance(wamid, str) or not wamid or not isinstance(sender, str) or not _USER_ID_RE.match(sender):
+            return self._skip_malformed(wamid, "id or sender")
         if state.seen(wamid):
             return False
-        try:
-            sent_at = int(message.get("timestamp"))
-        except (TypeError, ValueError):
+        if not isinstance(mtype, str) or (mtype == "text" and _text_body(message) is None):
+            return self._skip_malformed(wamid, "type or text")
+        sent_at = _timestamp(message.get("timestamp"))
+        if sent_at is None:
+            # Meta always sends one; if it ever doesn't (or sends garbage), the message itself is still good.
+            logger.warning("%s: inbound message without a usable timestamp; using the arrival time", LABEL)
             sent_at = int(time.time())
         if sent_at < state.start_timestamp - CLOCK_SKEW:
             return False  # retained backlog from before first activation
@@ -554,7 +643,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             inbound = await self._receive_media(message, sender, wamid)
             text = inbound.text
         else:
-            text = (message.get("text") or {}).get("body") if mtype == "text" else None
+            text = _text_body(message) if mtype == "text" else None
             if not isinstance(text, str) or not text.strip():
                 self._reject_unsupported(sender, wamid, mtype)
                 return False
@@ -601,6 +690,27 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         logger.info("%s: unsupported inbound type %r; notified sender", LABEL, shown)
         self._spawn(self._send_notice(sender, visible))
 
+    def _skip_malformed(self, wamid: Any, what: str) -> bool:
+        """A message whose envelope Meta shouldn't send: skip it (no read receipt, no notice, no content logged)
+        and remember its id when it has a usable one, so a re-poll doesn't look at it again."""
+        logger.warning("%s: malformed inbound message skipped (%s)", LABEL, what)
+        if _rememberable(wamid) and self._state is not None:
+            self._state.remember(wamid)
+        return False
+
+    def _skip_unhandled(self, message: dict[str, Any], exc: Exception) -> None:
+        """Last resort for a message that raised while being handled: skip it and keep polling (the offset
+        advances with the rest of the page). Only the exception type and location are logged, never its text."""
+        logger.error(
+            "%s: skipped an inbound message that could not be handled (%s at %s)",
+            LABEL,
+            type(exc).__name__,
+            _where(exc),
+        )
+        wamid = message.get("id") if isinstance(message, dict) else None
+        if _rememberable(wamid) and self._state is not None:
+            self._state.remember(wamid)
+
     # ------------------------------------------------------------ inbound media
     async def _receive_media(self, message: dict[str, Any], sender: str, wamid: str) -> _InboundMedia:
         """Download and cache one media message's attachment. Never raises (except on cancellation): any
@@ -611,7 +721,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         kind = str(message.get("type"))
         try:
             item = media.parse_inbound(message)
-        except ValueError:
+        except Exception:  # ValueError for a malformed media object; anything else is just as unusable
             item = None
         if item is None:
             logger.warning("%s: inbound %s with a malformed media object; told the agent", LABEL, kind)
@@ -642,7 +752,12 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         return self._keep_prepared(wamid, result)
 
     def _fetch_options(self) -> dict[str, Any]:
-        return {} if self._media_timeout is None else {"timeout": self._media_timeout}
+        options: dict[str, Any] = {}
+        if self._media_timeout is not None:
+            options["timeout"] = self._media_timeout
+        if self._media_retry_wait is not None:
+            options["retry_wait_cap"] = self._media_retry_wait
+        return options
 
     def _keep_prepared(self, wamid: str, result: _InboundMedia) -> _InboundMedia:
         self._prepared_media[wamid] = result
@@ -670,6 +785,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         if kind == "sticker":
             path = await compat.cache_image_from_bytes_async(data, ".webp")
             return _single(path, "image/webp", MessageType.PHOTO, caption or STICKER_NOTE)
+        refused_image = False
         if kind == "image" or mime.startswith("image/"):
             try:
                 path = await compat.cache_image_from_bytes_async(data, media.ext_for_mime(mime) or ".jpg")
@@ -679,17 +795,28 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
                     if refused not in _REFUSED_IMAGES:
                         raise
                     mime = refused
+                refused_image = True
             else:
                 return _single(path, mime, MessageType.PHOTO, caption)  # a photo sent as a document, too
         name = _document_name(item.filename, mime, "image" if kind == "image" else "document")
         path = await compat.cache_document_from_bytes_async(data, name)
-        _restrict_permissions(path)
-        inline = media.should_inline_text(name, mime, data)
+        try:
+            _restrict_permissions(path)
+            inline = media.should_inline_text(name, mime, data)
+        except BaseException:
+            _discard(path)
+            raise
         text = caption
+        # The MIME Hermes routes by (gateway/run.py): per attachment, it wins over the message type.
         if inline is not None:
             header = f"[Content of {_DISPLAY_UNSAFE.sub('_', name)}]:\n{inline}"
             text = f"{header}\n\n{caption}" if caption else header
-        return _InboundMedia(text, MessageType.DOCUMENT, [path], [mime], [inline is not None])
+            routed = mime if mime.startswith("text/") else "text/plain"  # else: a "binary, extract it" note
+        elif refused_image:
+            routed = media.OCTET_STREAM  # an image/* MIME would send it to vision, which can't read it
+        else:
+            routed = mime
+        return _InboundMedia(text, MessageType.DOCUMENT, [path], [routed], [inline is not None])
 
     async def _quoted_media(self, sender: str, message: dict[str, Any]) -> list[tuple[str, str]]:
         """Attachments recorded for the quoted message (ours or the user's), so a reply re-attaches them."""
@@ -715,7 +842,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         try:
             reaction = message.get("reaction")
             target = reaction.get("message_id") if isinstance(reaction, dict) else None
-            if not isinstance(target, str) or not target:
+            if not _valid_wamid(target):
                 logger.debug("%s: malformed reaction skipped", LABEL)
                 return
             if not self._reaction_sender_allowed(sender):
@@ -733,24 +860,20 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             handler = getattr(self, "_reaction_handler", None)
             if handler is not None:
                 own = await self._is_own_message(sender, target)
-                try:
-                    await handler(
-                        {
-                            "platform": PLATFORM_NAME,
-                            "event_name": f"reaction:{action}",
-                            "reaction": emoji,
-                            "user_id": sender,
-                            "item_user_id": "agent" if own else None,
-                            "item_type": "message",
-                            "channel_id": sender,
-                            "message_ts": target,
-                            "team_id": None,
-                            "event_ts": str(sent_at),
-                            "raw_event": raw_event,
-                        }
-                    )
-                except Exception:
-                    logger.debug("%s: reaction hook failed", LABEL, exc_info=True)
+                context = {
+                    "platform": PLATFORM_NAME,
+                    "event_name": f"reaction:{action}",
+                    "reaction": emoji,
+                    "user_id": sender,
+                    "item_user_id": "agent" if own else None,
+                    "item_type": "message",
+                    "channel_id": sender,
+                    "message_ts": target,
+                    "team_id": None,
+                    "event_ts": str(sent_at),
+                    "raw_event": raw_event,
+                }
+                await self._run_hook("reaction hook", lambda: handler(context))
             event_handler = getattr(self, "_platform_event_handler", None)
             if event_handler is not None:
                 name = self._names.get(sender)
@@ -773,23 +896,33 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
                         "thread_id": None,
                     },
                 }
-                try:
-                    await event_handler(event, source)
-                except Exception:
-                    logger.debug("%s: gateway_platform_event dispatch failed", LABEL, exc_info=True)
+                await self._run_hook("gateway_platform_event dispatch", lambda: event_handler(event, source))
             logger.debug("%s: reaction %s forwarded to hooks", LABEL, action)
         except Exception:
             logger.debug("%s: reaction handling failed", LABEL, exc_info=True)
 
-    @staticmethod
-    async def _is_own_message(chat_id: str, message_id: str) -> bool:
-        """True when ``message_id`` is a text message this adapter sent (recorded in ``rich_sent_store``)."""
+    async def _run_hook(self, what: str, call) -> None:
+        """Await one hook, bounded by ``_hook_timeout``: hooks run inside the poll loop, so a slow one would delay
+        every later message. A hook that blocks the event loop synchronously can't be bounded this way."""
         try:
+            await asyncio.wait_for(call(), self._hook_timeout)
+        except TimeoutError:
+            logger.warning("%s: %s took longer than %gs; abandoned", LABEL, what, self._hook_timeout)
+        except Exception:
+            logger.debug("%s: %s failed", LABEL, what, exc_info=True)
+
+    async def _is_own_message(self, chat_id: str, message_id: str) -> bool:
+        """True when ``message_id`` is a message this adapter sent: a text recorded in ``rich_sent_store``, or an
+        attachment recorded there that the user didn't send (inbound media is recorded too, for quotes, but the
+        user's own message ids are in the dedup window)."""
+        with contextlib.suppress(Exception):
             from gateway import rich_sent_store
 
-            return bool(await asyncio.to_thread(rich_sent_store.lookup, chat_id, message_id))
-        except Exception:
+            if await asyncio.to_thread(rich_sent_store.lookup, chat_id, message_id):
+                return True
+        if self._state is not None and self._state.seen(message_id):
             return False
+        return bool(await compat.lookup_media(chat_id, message_id))
 
     def _build_event(
         self,

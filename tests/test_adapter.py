@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from unittest.mock import AsyncMock
 
@@ -312,6 +313,131 @@ async def test_real_base_handler_receives_event(meta, api_key):
     await until(lambda: received)
     await a.disconnect()
     assert received[0].text == "via base" and received[0].source.platform.value == "whatsapp_agent_platform"
+
+
+# ---------------------------------------------------------------- malformed ("poison") messages
+def _poisoned(change) -> dict:
+    msg = text_message("wamid.bad", "SECRET-BODY")
+    change(msg)
+    return msg
+
+
+def _raw_page(*messages: dict, next_offset: int) -> httpx.Response:
+    """``updates_response`` serialised by ``json.dumps`` itself, so NaN and Infinity survive (Python's parser
+    accepts them)."""
+    body = json.loads(updates_response(next_offset=next_offset).content)
+    body["entry"][0]["changes"][0]["value"]["messages"] = list(messages)
+    return httpx.Response(200, content=json.dumps(body).encode(), headers={"content-type": "application/json"})
+
+
+async def _page_with_poison(a, meta, bad: dict) -> None:
+    """A page of [bad, good], then another page: both saved, so the loop kept going and the offset advanced."""
+    meta.queue("updates", _raw_page(bad, text_message("wamid.good", "good"), next_offset=2))
+    await until(lambda: saved_offset() == 2)
+    meta.queue("updates", updates_response(text_message("wamid.later", "later"), next_offset=3))
+    await until(lambda: saved_offset() == 3)
+
+
+POISON = {
+    "text-is-a-string": lambda m: m.update(text="SECRET-BODY"),
+    "text-is-a-list": lambda m: m.update(text=["SECRET-BODY"]),
+    "text-is-null": lambda m: m.update(text=None),
+    "text-missing": lambda m: m.pop("text"),
+    "body-is-a-number": lambda m: m.update(text={"body": 5}),
+    "body-is-an-object": lambda m: m.update(text={"body": {"x": "SECRET-BODY"}}),
+    "type-is-a-list": lambda m: m.update(type=["text"]),
+    "type-is-an-object": lambda m: m.update(type={"text": 1}),
+    "type-missing": lambda m: m.pop("type"),
+    "from-is-a-number": lambda m: m.update({"from": 50972923564215}),
+    "from-missing": lambda m: m.pop("from"),
+    "id-is-a-number": lambda m: m.update(id=5),
+    "id-is-empty": lambda m: m.update(id=""),
+    "id-is-a-list": lambda m: m.update(id=["wamid.bad"]),
+}
+
+
+@pytest.mark.parametrize("change", POISON.values(), ids=POISON.keys())
+@pytest.mark.asyncio
+async def test_malformed_message_is_skipped_and_polling_continues(meta, api_key, caplog, change):
+    a = make_adapter()
+    assert await a.connect()
+    await _page_with_poison(a, meta, _poisoned(change))
+    await a.disconnect()
+    assert [e.message_id for e in dispatched(a)] == ["wamid.good", "wamid.later"]
+    assert not a.has_fatal_error and a._save_failures == 0
+    a._notify_fatal_error.assert_not_awaited()
+    assert "wamid.bad" not in [b["message_id"] for b in meta.bodies("statuses")]  # no receipt for garbage
+    assert meta.calls("messages") == []  # no "unsupported" notice either
+    assert "SECRET-BODY" not in caplog.text
+    bad_id = _poisoned(change).get("id")
+    if isinstance(bad_id, str) and bad_id:
+        assert PollState.load(state_path(__import__("hermes_constants").get_hermes_home(), API_KEY)).seen(bad_id)
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        10**20,
+        "100000000000000000000",
+        10**12,
+        -1,
+        "-1",
+        0,
+        "abc",
+        "",
+        " ",
+        "1e9",
+        None,
+        True,
+        [],
+        {},
+        1e300,
+        float("inf"),
+        float("nan"),
+    ],
+    ids=lambda v: repr(v)[:24],
+)
+@pytest.mark.asyncio
+async def test_unusable_timestamp_uses_the_arrival_time(meta, api_key, timestamp):
+    """The message is otherwise fine, so it is dispatched, stamped with the arrival time (on Windows, 10**20 and -1
+    used to raise OSError from datetime and stop the platform as ``state_unwritable``)."""
+    a = make_adapter()
+    assert await a.connect()
+    bad = _poisoned(lambda m: m.update(timestamp=timestamp))
+    before = time.time()
+    await _page_with_poison(a, meta, bad)
+    await a.disconnect()
+    assert [e.message_id for e in dispatched(a)] == ["wamid.bad", "wamid.good", "wamid.later"]
+    assert before - 2 <= dispatched(a)[0].timestamp.timestamp() <= time.time() + 1
+    assert not a.has_fatal_error and a._save_failures == 0
+
+
+@pytest.mark.parametrize("timestamp", [1_790_000_000, "1790000000", " 1790000000 ", 1_790_000_000.5])
+def test_valid_timestamps_are_read(timestamp):
+    assert mod._timestamp(timestamp) == 1_790_000_000
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_on_one_message_skips_only_that_message(meta, api_key, caplog, monkeypatch):
+    """The last-resort guard: a message that raises anything but a handoff, Meta or state-save error is skipped
+    (logged by type and location, never by its text) instead of blocking the page forever."""
+    a = make_adapter()
+    real = a._build_event
+
+    def build(message, *args, **kwargs):
+        if message.get("id") == "wamid.bad":
+            raise ValueError("SECRET-BODY in an exception text")
+        return real(message, *args, **kwargs)
+
+    monkeypatch.setattr(a, "_build_event", build)
+    assert await a.connect()
+    await _page_with_poison(a, meta, text_message("wamid.bad", "x"))
+    await a.disconnect()
+    assert [e.message_id for e in dispatched(a)] == ["wamid.good", "wamid.later"]
+    assert not a.has_fatal_error and a._save_failures == 0
+    assert "SECRET-BODY" not in caplog.text
+    assert "ValueError" in caplog.text
+    assert PollState.load(state_path(__import__("hermes_constants").get_hermes_home(), API_KEY)).seen("wamid.bad")
 
 
 # ---------------------------------------------------------------- outbound
