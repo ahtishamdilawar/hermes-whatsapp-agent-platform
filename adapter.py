@@ -39,7 +39,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from hermes_constants import get_hermes_home
 
 from . import hermes_compat as compat
-from . import media, media_inbound
+from . import media, media_inbound, media_outbound
 from .client import (
     API_BASE,
     CODE_BAD_FIELD,
@@ -48,6 +48,8 @@ from .client import (
     AgentPlatformClient,
     AgentPlatformError,
     AuthError,
+    MediaGone,
+    MediaRejected,
     NotCreatorError,
     NotSent,
     PollConflict,
@@ -873,34 +875,44 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
     async def _send_chunks(
         self, to: str, chunks: list[str], *, reply_to: str | None, delivered: tuple[str, ...] = ()
     ) -> SendResult:
+        if self._client is None:
+            return SendResult(success=False, error="send_path_degraded", raw_response={"final": True})
+        async with self._send_lock:  # the manual forbids concurrent sends to one recipient
+            return await self._send_chunks_locked(to, chunks, reply_to=reply_to, delivered=delivered)
+
+    async def _send_chunks_locked(
+        self, to: str, chunks: list[str], *, reply_to: str | None, delivered: tuple[str, ...] = ()
+    ) -> SendResult:
+        """``_send_chunks`` for a caller already holding ``_send_lock`` (a media caption sent as text)."""
         client = self._client
         if client is None:
             return SendResult(success=False, error="send_path_degraded", raw_response={"final": True})
         ids = list(delivered)
-        async with self._send_lock:  # the manual forbids concurrent sends to one recipient
-            for index, chunk in enumerate(chunks):
-                quote = reply_to if index == 0 and not delivered else None
+        for index, chunk in enumerate(chunks):
+            quote = reply_to if index == 0 and not delivered else None
+            try:
+                wamid = await client.send_text(to, chunk, reply_to=quote)
+            except AgentPlatformError as exc:
+                if not (quote and self._is_stale_quote(exc)):
+                    return self._send_failure(exc, to, ids, chunks[index:])
+                # The quoted message is gone: nothing was sent, so send without the quote.
                 try:
-                    wamid = await client.send_text(to, chunk, reply_to=quote)
-                except AgentPlatformError as exc:
-                    if not (quote and self._is_stale_quote(exc)):
-                        return self._send_failure(exc, to, ids, chunks[index:])
-                    # The quoted message is gone: nothing was sent, so send without the quote.
-                    try:
-                        wamid = await client.send_text(to, chunk)
-                    except AgentPlatformError as retry_exc:
-                        return self._send_failure(retry_exc, to, ids, chunks[index:])
-                ids.append(wamid)
-                self._reply_sent_at[to] = time.monotonic()
-                with contextlib.suppress(Exception):
-                    from gateway import rich_sent_store
+                    wamid = await client.send_text(to, chunk)
+                except AgentPlatformError as retry_exc:
+                    return self._send_failure(retry_exc, to, ids, chunks[index:])
+            ids.append(wamid)
+            self._reply_sent_at[to] = time.monotonic()
+            with contextlib.suppress(Exception):
+                from gateway import rich_sent_store
 
-                    rich_sent_store.record(to, wamid, chunk)
+                rich_sent_store.record(to, wamid, chunk)
         logger.info("%s: response sent (%d message(s))", LABEL, len(ids) - len(delivered))
         return SendResult(success=True, message_id=ids[-1] if ids else None, continuation_message_ids=tuple(ids[:-1]))
 
     @staticmethod
     def _is_stale_quote(exc: AgentPlatformError) -> bool:
+        """Text only. The media path never uses this: there code 100/131009 mean a bad caption, media type or
+        size (``MediaRejected``), so it has its own narrow check (``media_outbound.is_stale_media_quote``)."""
         return type(exc) is NotSent and exc.status == 400 and exc.code in (CODE_INVALID_PARAMETER, CODE_BAD_FIELD)
 
     @staticmethod
@@ -937,6 +949,15 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
                 error_kind="transient",
             )
         raw["final"] = True
+        if isinstance(exc, (MediaRejected, MediaGone)):
+            # Meta refused the file or its fields (or its id expired twice): resending it cannot help.
+            return SendResult(
+                success=False,
+                error=f"media rejected: {detail}",
+                raw_response=raw,
+                retryable=False,
+                error_kind="unknown",
+            )
         if isinstance(exc, NotCreatorError):
             return SendResult(success=False, error=f"forbidden: {detail}", raw_response=raw, error_kind="forbidden")
         if isinstance(exc, AuthError):
@@ -975,6 +996,253 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             async with self._send_lock:
                 await client.send_text(to, text)
                 self._reply_sent_at[to] = time.monotonic()
+
+    # ---------------------------------------------------------- outbound media
+    # Parameter names, order and defaults are Hermes's own (cron and Kanban call with keywords only, the
+    # send_message tool positionally, the reply path adds ``is_voice=``). ``send_multiple_images`` stays the
+    # base loop over ``send_image_file``, which keeps its "at least one image delivered" result.
+    _media_wait_bound = media_outbound.WAIT_BOUND
+    _media_pacing_after = media_outbound.PACING_NOTICE_AFTER
+    _media_retry_backoff = media_outbound.RETRY_BACKOFF
+    _media_pacing_interval = 60.0  # at most one pacing notice per recipient per window
+
+    def _media_on(self) -> bool:
+        return bool(getattr(self, "_media_enabled", True))
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        if not self._media_on():
+            return await super().send_image_file(
+                chat_id, image_path, caption=caption, reply_to=reply_to, metadata=metadata, **kwargs
+            )
+        return (await self._send_media(chat_id, image_path, "image", caption, reply_to, metadata, kwargs))[0]
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        if not self._media_on():
+            return await super().send_video(
+                chat_id, video_path, caption=caption, reply_to=reply_to, metadata=metadata, **kwargs
+            )
+        return (await self._send_media(chat_id, video_path, "video", caption, reply_to, metadata, kwargs))[0]
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Audio always arrives as a plain attachment on this platform (no voice bubble), so ``is_voice`` is
+        ignored; a caption goes first as text, because audio takes none."""
+        if not self._media_on():
+            return await super().send_voice(
+                chat_id, audio_path, caption=caption, reply_to=reply_to, metadata=metadata, **kwargs
+            )
+        return (await self._send_media(chat_id, audio_path, "voice", caption, reply_to, metadata, kwargs))[0]
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: str | None = None,
+        file_name: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """The bytes go unmodified as a document (Hermes routes ``[[as_document]]`` files here)."""
+        if not self._media_on():
+            return await super().send_document(
+                chat_id, file_path, caption=caption, file_name=file_name, reply_to=reply_to, metadata=metadata, **kwargs
+            )
+        kwargs["file_name"] = file_name
+        return (await self._send_media(chat_id, file_path, "document", caption, reply_to, metadata, kwargs))[0]
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Fetch the URL with Hermes's SSRF-guarded image cache, then send it like a local image. Any fetch
+        failure, or a send that certainly did not deliver, falls back to the base behaviour (the link as
+        text). The URL itself is never fetched by the plugin."""
+        if not self._media_on():
+            return await super().send_image(chat_id, image_url, caption=caption, reply_to=reply_to, metadata=metadata)
+        refused = self._media_precheck(chat_id)
+        if refused is not None:
+            return refused
+        try:
+            path = await compat.cache_image_from_url(image_url)
+        except Exception as exc:
+            logger.info("%s: image URL not fetched (%s); sending it as a link", LABEL, type(exc).__name__)
+            return await super().send_image(chat_id, image_url, caption=caption, reply_to=reply_to, metadata=metadata)
+        result, outcome = await self._send_media(chat_id, path, "image", caption, reply_to, metadata, {})
+        if result.success or not self._media_certainly_unsent(outcome):
+            return result
+        return await super().send_image(chat_id, image_url, caption=caption, reply_to=reply_to, metadata=metadata)
+
+    def _media_precheck(self, chat_id: str) -> SendResult | None:
+        """Before any fetch or upload: a live client and a recipient Meta will deliver to (only the creator)."""
+        client = self._client
+        if client is None or client.closed:
+            return SendResult(success=False, error="send_path_degraded", raw_response={"final": True})
+        to = self._resolve_recipient(chat_id)
+        creator = self._state.creator if self._state is not None else None
+        if to is None or creator is None:
+            return SendResult(
+                success=False,
+                error="recipient unknown: the agent's creator has not been confirmed yet (message the agent once)",
+                error_kind="unknown",
+                raw_response={"final": True},
+            )
+        if to != creator or to in self._non_creators:
+            logger.warning("%s: media not sent to %s: not the agent's creator", LABEL, _id_hint(to))
+            return SendResult(
+                success=False,
+                error="forbidden: media can only be sent to the agent's creator",
+                error_kind="forbidden",
+                raw_response={"final": True},
+            )
+        return None
+
+    @staticmethod
+    def _media_certainly_unsent(outcome: media_outbound.MediaOutcome | None) -> bool:
+        if outcome is None or outcome.text_failure is not None or outcome.wait is not None:
+            return False
+        if outcome.refusal is not None:
+            return True
+        exc = outcome.error
+        return isinstance(exc, NotSent) and not isinstance(exc, (NotCreatorError, AuthError))
+
+    def _media_deny_dirs(self) -> list[str]:
+        """The plugin's own state directory is never uploaded (on top of ``media.is_denied_path``'s names)."""
+        if self._state is not None:
+            return [str(self._state.path.parent)]
+        return [str(get_hermes_home() / "platforms" / PLATFORM_NAME)]
+
+    async def _send_media(
+        self,
+        chat_id: str,
+        path: str,
+        requested: str,
+        caption: str | None,
+        reply_to: str | None,
+        metadata: Any,
+        kwargs: dict[str, Any],
+    ) -> tuple[SendResult, media_outbound.MediaOutcome | None]:
+        refused = self._media_precheck(chat_id)
+        if refused is not None:
+            return refused, None
+        client = self._client
+        to = self._resolve_recipient(chat_id)
+        assert client is not None and to is not None
+
+        async def caption_text(text: str, quote: str | None) -> None:
+            # Runs while media_outbound holds _send_lock: the normal text path, minus the lock.
+            result = await self._send_chunks_locked(to, _chunks(to_whatsapp(text)), reply_to=quote)
+            if not result.success:
+                raise media_outbound.TextNotSent(result)
+
+        async def pacing(wait: float) -> None:
+            await self._media_pacing_notice(chat_id, to, wait, metadata)
+
+        outcome = await media_outbound.send_media_file(
+            client,
+            to,
+            path,
+            requested=requested,
+            caption=caption,
+            reply_to=reply_to,
+            file_name=kwargs.get("file_name"),
+            force_document=requested == "document" or bool(kwargs.get("force_document")),
+            transcoder=compat.transcode_to_ogg_opus,
+            deny_dirs=self._media_deny_dirs(),
+            lock=self._send_lock,
+            send_text=caption_text,
+            notify_pacing=pacing,
+            note_filter=self._media_note,
+            wait_bound=self._media_wait_bound,
+            pacing_after=self._media_pacing_after,
+            retry_backoff=self._media_retry_backoff,
+        )
+        return await self._media_result(outcome, to), outcome
+
+    async def _media_result(self, outcome: media_outbound.MediaOutcome, to: str) -> SendResult:
+        if outcome.success:
+            self._reply_sent_at[to] = time.monotonic()
+            # So a quote of this attachment re-attaches it (lookup drops files that no longer exist).
+            await compat.record_media(to, outcome.message_id, [(outcome.path, outcome.mime)])
+            return SendResult(success=True, message_id=outcome.message_id)
+        if outcome.text_failure is not None:
+            if isinstance(outcome.text_failure, SendResult):
+                return outcome.text_failure
+            return SendResult(success=False, error="caption not sent", error_kind="unknown")
+        if outcome.refusal is not None:
+            # Base sends its own "couldn't deliver" notice for non-image files; none is added here.
+            return SendResult(
+                success=False,
+                error=f"media not sent: {outcome.refusal}",
+                retryable=False,
+                error_kind="unknown",
+                raw_response={"final": True},
+            )
+        if outcome.wait is not None:
+            wait = float(max(1, round(outcome.wait)))
+            logger.warning("%s: media not sent: send budget exhausted for %.0fs", LABEL, wait)
+            return SendResult(
+                success=False,
+                error=f"flood_control:{wait:g}",
+                retry_after=wait,
+                error_kind="rate_limited",
+                raw_response={"final": True},
+            )
+        assert outcome.error is not None
+        return self._send_failure(outcome.error, to, [], [])
+
+    def _media_note(self, note: str) -> str | None:
+        """The "sent as a file" caption note, hidden when the operator suppresses warning notices."""
+        warning_text = getattr(self, "warning_text", None)
+        if warning_text is None:
+            return note
+        try:
+            return warning_text(note, "")
+        except Exception:
+            return note
+
+    async def _media_pacing_notice(self, chat_id: str, to: str, wait: float, metadata: Any) -> None:
+        """One "pausing for the rate limit" notice (Signal's pattern), only when it can go out now: when the
+        messages budget itself is what we wait for, a notice would only arrive with the file."""
+        emit = getattr(self, "emit_warning", None)
+        client = self._client
+        if emit is None or client is None or client.limits["messages"].remaining() <= 0:
+            return
+        sent_at: dict[str, float] = self.__dict__.setdefault("_media_pacing_at", {})
+        now = time.monotonic()
+        if now - sent_at.get(to, float("-inf")) < self._media_pacing_interval:
+            return
+        sent_at[to] = now
+        seconds = max(1, round(wait))
+        await emit(chat_id, f"(More files coming: pausing ~{seconds}s for WhatsApp's send limit.)", metadata=metadata)
 
     # ----------------------------------------------------------- read / typing
     def _note_status(self, wamid: str) -> None:
