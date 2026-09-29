@@ -175,12 +175,13 @@ def test_tables_match_the_live_probes_and_the_fake():
         assert m.upload_limit(mime) == UPLOAD_MIME_RULES[mime].limit
 
 
-def test_text_exts_mirror_hermes():
+def test_text_exts_within_hermes():
+    # Only inline what Hermes itself treats as text; Hermes may add extensions on main without breaking us.
     base = pytest.importorskip("gateway.platforms.base")
     hermes = getattr(base, "_TEXT_INJECT_EXTENSIONS", None)
     if hermes is None:
         pytest.skip("Hermes no longer has _TEXT_INJECT_EXTENSIONS")
-    assert m.TEXT_EXTS == frozenset(hermes)
+    assert m.TEXT_EXTS <= frozenset(hermes)
 
 
 def test_ext_for_mime_and_upload_limit():
