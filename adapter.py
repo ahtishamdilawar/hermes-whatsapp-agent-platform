@@ -16,19 +16,30 @@ import asyncio
 import collections
 import contextlib
 import logging
+import os
 import re
 import threading
 import time
+import unicodedata
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms._shared import env_is_connected, get_scoped_secret, seed_extra_from_env, send_error
+from gateway.platforms._shared import (
+    env_is_connected,
+    extra_or_secret,
+    get_scoped_secret,
+    seed_extra_from_env,
+    send_error,
+)
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from hermes_constants import get_hermes_home
 
+from . import hermes_compat as compat
+from . import media, media_inbound
 from .client import (
     API_BASE,
     CODE_BAD_FIELD,
@@ -45,6 +56,7 @@ from .client import (
     Updates,
 )
 from .formatting import to_whatsapp
+from .media_inbound import InboundMediaError, failure_note, fetch_inbound_media, media_hint
 from .state import PollState, key_fingerprint, read_creator, state_path
 
 logger = logging.getLogger(__name__)
@@ -56,10 +68,13 @@ HOME_ENV = "WHATSAPP_AGENT_PLATFORM_HOME_CHANNEL"
 ALLOWED_ENV = "WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS"
 ALLOW_ALL_ENV = "WHATSAPP_AGENT_PLATFORM_ALLOW_ALL_USERS"
 BASE_URL_ENV = "WHATSAPP_AGENT_PLATFORM_BASE_URL"  # development only: point at a fake API
+MEDIA_ENV = "WHATSAPP_AGENT_PLATFORM_MEDIA_ENABLED"  # default on; false/0/no/off = text only
+MEDIA_KEY = "media_enabled"  # the same switch in config.yaml (platform ``extra``)
 SELF_TARGET = "self"
 
 _USER_ID_RE = re.compile(r"^user:\S+$")
 _TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 POLL_TIMEOUT = 20  # seconds; Meta allows 0-25
@@ -74,6 +89,34 @@ CONFLICT_BACKOFF = 60.0  # after a 409, let the other poller finish before polli
 CONFLICT_LIMIT, CONFLICT_WINDOW = 3, 600.0  # this many 409s in the window = a real second poller
 SAVE_FAILURE_LIMIT = 5  # consecutive state-save failures before the platform gives up
 UNSUPPORTED_NOTICE = "I can only read text messages on this channel for now — please send your request as text."
+UNSUPPORTED_TYPE_NOTICE = (
+    "I can't read this kind of message on this channel — please send text, a photo, a voice note or a document."
+)
+DOCUMENTED_TYPES = frozenset({"text", "reaction", *media.MEDIA_KINDS})  # the manual's seven inbound types
+MAX_REACTION_CHARS = 32
+PREPARED_MEDIA_MAX = 32  # downloaded media kept per wamid, so a Hermes handoff retry doesn't download again
+STICKER_NOTE = "[The user sent a sticker]"
+_BIDI_CONTROLS = frozenset("\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+_DISPLAY_UNSAFE = re.compile(r"[^\w.\- ]")  # Hermes's rule for names shown in prompt notes
+_REFUSED_IMAGES = frozenset({"image/heic", "image/heif", "image/avif", "image/tiff"})  # the image cache refuses
+_DEFAULT_MIME = {
+    "image": "image/jpeg",
+    "audio": "audio/ogg",
+    "video": "video/mp4",
+    "document": media.OCTET_STREAM,
+    "sticker": "image/webp",
+}
+
+
+@dataclass
+class _InboundMedia:
+    """What a media message turned into: the event text and type, and aligned attachment lists."""
+
+    text: str
+    message_type: MessageType
+    urls: list[str] = field(default_factory=list)
+    types: list[str] = field(default_factory=list)
+    inlined: list[bool] = field(default_factory=list)
 
 
 class HandoffError(Exception):
@@ -101,6 +144,58 @@ def _base_url() -> str:
 def _csv_env(name: str) -> set[str]:
     raw = str(get_scoped_secret(name, "") or "")
     return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _on_unless_falsy(value: Any) -> bool:
+    """A default-on switch: only false/0/no/off (or a YAML ``false``) turns it off."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in _FALSY
+
+
+def _media_enabled(config: Any) -> bool:
+    """``WHATSAPP_AGENT_PLATFORM_MEDIA_ENABLED`` (env wins), else ``media_enabled`` in the platform's config."""
+    extra = getattr(config, "extra", None)
+    return _on_unless_falsy(extra_or_secret(extra if isinstance(extra, dict) else None, MEDIA_KEY, MEDIA_ENV, True))
+
+
+def _restrict_permissions(path: str) -> None:
+    """Best effort: make a cached inbound file readable by its owner only (POSIX; Windows keeps the profile ACL)."""
+    if os.name == "posix":
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+
+
+def _clean_emoji(value: Any) -> str:
+    """A reaction emoji for hooks: control and bidi characters dropped (ZWJ kept), at most 32 characters."""
+    if not isinstance(value, str):
+        return ""
+    text = "".join(ch for ch in value if unicodedata.category(ch) != "Cc" and ch not in _BIDI_CONTROLS)
+    return text.strip()[:MAX_REACTION_CHARS]
+
+
+def _media_label(kind: str, *, voice: bool = False, filename: str | None = None) -> str:
+    """How a failure note names the attachment ("an image", "a document ('report.pdf')")."""
+    if kind == "audio":
+        return "a voice message" if voice else "an audio file"
+    if kind == "document" and filename:
+        name = _DISPLAY_UNSAFE.sub("_", media.sanitize_filename(filename, default_stem="document"))
+        return f"a document ('{name}')"
+    return {"image": "an image", "video": "a video", "sticker": "a sticker"}.get(kind, "a document")
+
+
+def _document_name(filename: str | None, mime: str, default_stem: str) -> str:
+    """The sanitised name for the document cache; the MIME's extension is added only when the name has none."""
+    name = media.sanitize_filename(filename, default_stem=default_stem)
+    ext = media.ext_for_mime(mime)
+    if ext and not os.path.splitext(name)[1]:
+        name = media.sanitize_filename(filename, default_stem=default_stem, ext=ext)
+    return name
+
+
+def _single(path: str, mime: str, message_type: MessageType, text: str) -> _InboundMedia:
+    _restrict_permissions(path)
+    return _InboundMedia(text, message_type, [path], [mime], [False])
 
 
 def _id_hint(user_id: str) -> str:
@@ -171,6 +266,9 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         self._poll_min_interval = POLL_MIN_INTERVAL
         self._backoff_base = 2.0
         self._conflict_backoff = CONFLICT_BACKOFF
+        self._media_enabled = _media_enabled(config)
+        self._media_timeout: float | None = None  # None = media_inbound.FETCH_DEADLINE; tests shrink it
+        self._prepared_media: collections.OrderedDict[str, _InboundMedia] = collections.OrderedDict()
 
     @property
     def name(self) -> str:
@@ -431,8 +529,10 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         if sent_at < state.start_timestamp - CLOCK_SKEW:
             return False  # retained backlog from before first activation
         if mtype == "reaction":
-            logger.debug("%s: reaction received (not forwarded)", LABEL)
+            # Before _authorize on purpose: a reaction never calls /statuses (no read receipt, no typing) and
+            # never pins the creator. It reaches hooks only, never the agent.
             state.remember(wamid)
+            await self._forward_reaction(message, sender, wamid, sent_at)
             return False
         if not await self._authorize(sender, wamid):
             state.remember(wamid)
@@ -446,14 +546,19 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             self._note_status(wamid)
             self._spawn(self._post_status(wamid, self._typing_enabled()))
 
-        text = (message.get("text") or {}).get("body") if mtype == "text" else None
-        if not isinstance(text, str) or not text.strip():
-            logger.info("%s: unsupported inbound type %r; notified sender", LABEL, mtype)
-            state.remember(wamid)
-            self._spawn(self._send_notice(sender, UNSUPPORTED_NOTICE))
-            return False
+        inbound: _InboundMedia | None = None
+        if mtype in media.MEDIA_KINDS and self._media_enabled:
+            # Only after a positive _authorize, and inline: the offset is saved once the page is handed off.
+            inbound = await self._receive_media(message, sender, wamid)
+            text = inbound.text
+        else:
+            text = (message.get("text") or {}).get("body") if mtype == "text" else None
+            if not isinstance(text, str) or not text.strip():
+                self._reject_unsupported(sender, wamid, mtype)
+                return False
 
-        event = self._build_event(message, sender, wamid, text, sent_at)
+        quoted_media = await self._quoted_media(sender, message) if self._media_enabled else []
+        event = self._build_event(message, sender, wamid, text, sent_at, inbound, quoted_media)
         try:
             await self.handle_message(event)
         except Exception as exc:
@@ -470,13 +575,242 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
                 raise HandoffError(type(exc).__name__) from exc
             logger.error("%s: skipping a message Hermes rejected %d times", LABEL, attempts, exc_info=True)
         self._handoff_failures.pop(wamid, None)
+        self._prepared_media.pop(wamid, None)
         state.remember(wamid)
+        if inbound is not None:
+            # Persist the dedup window now (the offset is unchanged): a restart later in this page must not
+            # replay a message whose media was already downloaded and handed off.
+            state.save()
         return True
 
-    def _build_event(self, message: dict[str, Any], sender: str, wamid: str, text: str, sent_at: int) -> MessageEvent:
+    def _reject_unsupported(self, sender: str, wamid: str, mtype: Any) -> None:
+        """A type we can't hand to Hermes: remember it and tell the sender, unless warnings are suppressed."""
+        assert self._state is not None
+        self._state.remember(wamid)
+        notice = UNSUPPORTED_TYPE_NOTICE if self._media_enabled else UNSUPPORTED_NOTICE
+        try:
+            visible = self.warning_text(notice)  # honours display.suppress_warning_notifications
+        except Exception:
+            visible = notice
+        shown = mtype if mtype in DOCUMENTED_TYPES else "other"
+        if not visible:
+            logger.info("%s: unsupported inbound type %r; notice suppressed", LABEL, shown)
+            return
+        logger.info("%s: unsupported inbound type %r; notified sender", LABEL, shown)
+        self._spawn(self._send_notice(sender, visible))
+
+    # ------------------------------------------------------------ inbound media
+    async def _receive_media(self, message: dict[str, Any], sender: str, wamid: str) -> _InboundMedia:
+        """Download and cache one media message's attachment. Never raises (except on cancellation): any
+        failure becomes a bracketed note for the agent, and the message is still dispatched with its caption."""
+        prepared = self._prepared_media.get(wamid)
+        if prepared is not None:  # a Hermes handoff retry: don't download again
+            return prepared
+        kind = str(message.get("type"))
+        try:
+            item = media.parse_inbound(message)
+        except ValueError:
+            item = None
+        if item is None:
+            logger.warning("%s: inbound %s with a malformed media object; told the agent", LABEL, kind)
+            result = _InboundMedia(failure_note(media_inbound.FAILED, _media_label(kind)), MessageType.TEXT)
+            return self._keep_prepared(wamid, result)
+        caption = item.caption or ""
+        label = _media_label(item.kind, voice=item.voice, filename=item.filename)
+        reason, size, limit = None, None, None
+        try:
+            cap = media.inbound_cap(item.kind, compat.inbound_media_max_bytes())
+            data = await fetch_inbound_media(self._client, item, max_bytes=cap, **self._fetch_options())
+            result = await self._cache_media(item, data, caption)
+        except InboundMediaError as exc:
+            reason, size, limit = exc.reason, exc.size, exc.limit
+        except ValueError:  # the image cache refused the bytes (not an image it can use)
+            reason = media_inbound.UNSUPPORTED
+        except Exception as exc:  # OSError from a cache write, anything unexpected: never reaches the poll loop
+            logger.warning("%s: caching inbound %s failed (%s)", LABEL, item.kind, type(exc).__name__)
+            reason = media_inbound.FAILED
+        if reason is not None:
+            hint = media_hint(item.media_id)
+            logger.warning("%s: inbound %s %s not received (%s); told the agent", LABEL, item.kind, hint, reason)
+            note = failure_note(reason, label, size=size, limit=limit)
+            result = _InboundMedia(f"{caption}\n\n{note}" if caption else note, MessageType.TEXT)
+        else:
+            await compat.record_media(sender, wamid, list(zip(result.urls, result.types, strict=True)))
+            logger.info("%s: received %s %s", LABEL, item.kind, media_hint(item.media_id))
+        return self._keep_prepared(wamid, result)
+
+    def _fetch_options(self) -> dict[str, Any]:
+        return {} if self._media_timeout is None else {"timeout": self._media_timeout}
+
+    def _keep_prepared(self, wamid: str, result: _InboundMedia) -> _InboundMedia:
+        self._prepared_media[wamid] = result
+        self._prepared_media.move_to_end(wamid)
+        while len(self._prepared_media) > PREPARED_MEDIA_MAX:
+            self._prepared_media.popitem(last=False)
+        return result
+
+    async def _cache_media(self, item: media.InboundMedia, data: bytes, caption: str) -> _InboundMedia:
+        """Cache the bytes with Hermes's kind-specific helper and describe them for the event.
+
+        Raises ``ValueError`` when the image cache refuses an image or sticker it can't fall back from, and
+        ``OSError`` when a cache write fails (the caller turns both into notes).
+        """
+        kind = item.kind
+        sniffed = media.sniff_mime(data[:4096])
+        mime = item.mime or sniffed or _DEFAULT_MIME[kind]
+        if kind == "audio":
+            path = await compat.cache_audio_from_bytes_async(data, media.ext_for_mime(mime) or ".ogg")
+            voice = MessageType.VOICE if item.voice else MessageType.AUDIO  # only voice notes are transcribed
+            return _single(path, mime, voice, caption)
+        if kind == "video":
+            path = await compat.cache_video_from_bytes_async(data, media.ext_for_mime(mime) or ".mp4")
+            return _single(path, mime, MessageType.VIDEO, caption)
+        if kind == "sticker":
+            path = await compat.cache_image_from_bytes_async(data, ".webp")
+            return _single(path, "image/webp", MessageType.PHOTO, caption or STICKER_NOTE)
+        if kind == "image" or mime.startswith("image/"):
+            try:
+                path = await compat.cache_image_from_bytes_async(data, media.ext_for_mime(mime) or ".jpg")
+            except ValueError:
+                if kind == "image":  # only formats the image cache refuses by design go on as a document
+                    refused = mime if mime in _REFUSED_IMAGES else sniffed
+                    if refused not in _REFUSED_IMAGES:
+                        raise
+                    mime = refused
+            else:
+                return _single(path, mime, MessageType.PHOTO, caption)  # a photo sent as a document, too
+        name = _document_name(item.filename, mime, "image" if kind == "image" else "document")
+        path = await compat.cache_document_from_bytes_async(data, name)
+        _restrict_permissions(path)
+        inline = media.should_inline_text(name, mime, data)
+        text = caption
+        if inline is not None:
+            header = f"[Content of {_DISPLAY_UNSAFE.sub('_', name)}]:\n{inline}"
+            text = f"{header}\n\n{caption}" if caption else header
+        return _InboundMedia(text, MessageType.DOCUMENT, [path], [mime], [inline is not None])
+
+    async def _quoted_media(self, sender: str, message: dict[str, Any]) -> list[tuple[str, str]]:
+        """Attachments recorded for the quoted message (ours or the user's), so a reply re-attaches them."""
+        context = message.get("context")
+        quoted = context.get("id") if isinstance(context, dict) else None
+        if not isinstance(quoted, str) or not quoted:
+            return []
+        return await compat.lookup_media(sender, quoted)
+
+    # --------------------------------------------------------------- reactions
+    def _reaction_sender_allowed(self, sender: str) -> bool:
+        """The creator Meta already confirmed, or an allowed sender. Never probes Meta, never pins the creator."""
+        state = self._state
+        if state is not None and state.creator is not None and sender == state.creator:
+            return True
+        if str(get_scoped_secret(ALLOW_ALL_ENV, "") or "").strip().lower() in _TRUTHY:
+            return True
+        return sender in _csv_env(ALLOWED_ENV)
+
+    async def _forward_reaction(self, message: dict[str, Any], sender: str, wamid: str, sent_at: int) -> None:
+        """Emit a reaction to Hermes's hooks: ``reaction:added``/``reaction:removed`` (via the reaction handler)
+        and the ``gateway_platform_event`` plugin hook. No agent turn. Never raises into the poll loop."""
+        try:
+            reaction = message.get("reaction")
+            target = reaction.get("message_id") if isinstance(reaction, dict) else None
+            if not isinstance(target, str) or not target:
+                logger.debug("%s: malformed reaction skipped", LABEL)
+                return
+            if not self._reaction_sender_allowed(sender):
+                logger.debug("%s: reaction from a sender who is not allowed (id %s) dropped", LABEL, _id_hint(sender))
+                return
+            # Meta delivers additions only (live); an empty or missing emoji is treated as a removal.
+            emoji = _clean_emoji(reaction.get("emoji"))
+            action = "added" if emoji else "removed"
+            raw_event = {
+                "id": wamid,
+                "type": "reaction",
+                "timestamp": str(sent_at),
+                "reaction": {"message_id": target, "emoji": emoji},
+            }
+            handler = getattr(self, "_reaction_handler", None)
+            if handler is not None:
+                own = await self._is_own_message(sender, target)
+                try:
+                    await handler(
+                        {
+                            "platform": PLATFORM_NAME,
+                            "event_name": f"reaction:{action}",
+                            "reaction": emoji,
+                            "user_id": sender,
+                            "item_user_id": "agent" if own else None,
+                            "item_type": "message",
+                            "channel_id": sender,
+                            "message_ts": target,
+                            "team_id": None,
+                            "event_ts": str(sent_at),
+                            "raw_event": raw_event,
+                        }
+                    )
+                except Exception:
+                    logger.debug("%s: reaction hook failed", LABEL, exc_info=True)
+            event_handler = getattr(self, "_platform_event_handler", None)
+            if event_handler is not None:
+                name = self._names.get(sender)
+                source = self.build_source(
+                    chat_id=sender,
+                    chat_name=name or "WhatsApp",
+                    chat_type="dm",
+                    user_id=sender,
+                    user_name=name,
+                    message_id=wamid,
+                )
+                event = {
+                    "platform": PLATFORM_NAME,
+                    "event_type": "reaction",
+                    "payload": {
+                        "emojis": [emoji] if emoji else [],
+                        "custom_emoji_ids": [],
+                        "chat_id": sender,
+                        "message_id": target,
+                        "thread_id": None,
+                    },
+                }
+                try:
+                    await event_handler(event, source)
+                except Exception:
+                    logger.debug("%s: gateway_platform_event dispatch failed", LABEL, exc_info=True)
+            logger.debug("%s: reaction %s forwarded to hooks", LABEL, action)
+        except Exception:
+            logger.debug("%s: reaction handling failed", LABEL, exc_info=True)
+
+    @staticmethod
+    async def _is_own_message(chat_id: str, message_id: str) -> bool:
+        """True when ``message_id`` is a text message this adapter sent (recorded in ``rich_sent_store``)."""
+        try:
+            from gateway import rich_sent_store
+
+            return bool(await asyncio.to_thread(rich_sent_store.lookup, chat_id, message_id))
+        except Exception:
+            return False
+
+    def _build_event(
+        self,
+        message: dict[str, Any],
+        sender: str,
+        wamid: str,
+        text: str,
+        sent_at: int,
+        inbound: _InboundMedia | None = None,
+        quoted_media: list[tuple[str, str]] | None = None,
+    ) -> MessageEvent:
         name = self._names.get(sender)
         context = message.get("context") if isinstance(message.get("context"), dict) else {}
         quoted = context.get("id") if isinstance(context.get("id"), str) else None
+        # The three media lists stay aligned: one type and one inlined flag per path, quoted media included.
+        urls = list(inbound.urls) if inbound else []
+        types = list(inbound.types) if inbound else []
+        inlined = list(inbound.inlined) if inbound else []
+        for path, mime in quoted_media or ():
+            if path and path not in urls:
+                urls.append(path)
+                types.append(media.base_mime(mime) or "")
+                inlined.append(False)
         quoted_own = bool(quoted and str(context.get("from", "")).startswith("agent:"))
         reply_text = None
         if quoted_own:
@@ -494,7 +828,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         )
         return MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=inbound.message_type if inbound else MessageType.TEXT,
             source=source,
             user_id=sender,
             user_name=name,
@@ -504,6 +838,9 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             reply_to_message_id=quoted,
             reply_to_text=reply_text,
             reply_to_is_own_message=quoted_own,
+            media_urls=urls,
+            media_types=types,
+            media_text_inlined=inlined,
         )
 
     # --------------------------------------------------------------- outbound
@@ -693,7 +1030,7 @@ def _has_key(config: Any = None) -> bool:
 def _env_enablement() -> dict[str, Any] | None:
     if not _api_key():
         return None
-    return seed_extra_from_env((), home_env=HOME_ENV, home_default=SELF_TARGET)
+    return seed_extra_from_env(((MEDIA_ENV, MEDIA_KEY, _on_unless_falsy),), home_env=HOME_ENV, home_default=SELF_TARGET)
 
 
 def _parse_target(ref: str) -> tuple[str, str | None] | None:

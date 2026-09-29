@@ -259,21 +259,23 @@ async def test_unconfirmable_sender_is_rechecked_without_advancing(meta, api_key
 
 @pytest.mark.asyncio
 async def test_unsupported_type_gets_a_text_notice(meta, api_key):
-    image = {
+    # A type outside the manual's seven (text, image, audio, video, document, sticker, reaction).
+    location = {
         "from": CREATOR,
-        "id": "wamid.img",
+        "id": "wamid.loc",
         "timestamp": str(int(time.time()) + 5),
-        "type": "image",
-        "image": {"id": "123", "mime_type": "image/jpeg", "sha256": "abc="},
+        "type": "location",
+        "location": {"latitude": 1.0, "longitude": 2.0},
     }
     a = make_adapter()
     assert await a.connect()
-    meta.queue("updates", updates_response(image, next_offset=2))
+    meta.queue("updates", updates_response(location, next_offset=2))
     await until(lambda: len(meta.calls("messages")) == 1)
     await a.disconnect()
     assert a.handle_message.await_count == 0
     body = meta.bodies("messages")[0]
-    assert body["to"] == CREATOR and "text" in body["text"]["body"]
+    assert body["to"] == CREATOR and body["text"]["body"]
+    assert meta.calls("media_get") == []
 
 
 @pytest.mark.asyncio
