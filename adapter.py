@@ -1491,7 +1491,14 @@ PLATFORM_HINT = (
     "agent. Standard markdown auto-converts to WhatsApp syntax (bold, italic, strike, monospace) "
     "— write markdown freely, bullets included. No tables — use bullets or labeled lines. Sent "
     "messages cannot be edited or deleted, and replies over 4000 characters are split into "
-    "several messages (max 12 per minute), so keep answers concise. Only text can be sent here."
+    "several messages (max 12 per minute), so keep answers concise. "
+    "You can send files natively: write MEDIA:/absolute/path/to/file in your response, on its own line. "
+    "Images go as photos (JPEG/PNG; other formats are converted), MP4 videos play inline, audio arrives as a "
+    "normal audio file (no voice-note bubble), documents up to 16 MB, other formats arrive as files. Captions "
+    "max 1024 characters. Add [[as_document]] to send an image untouched as a file. Prefer PDF over Markdown "
+    "for documents, and zip many files into one instead of sending lots. Image URLs via ![alt](url) are "
+    "downloaded and sent as photos when possible. You can receive photos, voice notes (transcribed), videos "
+    "and documents; audio files are not transcribed."
 )
 
 

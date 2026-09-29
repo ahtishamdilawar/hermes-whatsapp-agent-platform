@@ -492,6 +492,9 @@ def test_register_declares_platform_capabilities():
         assert callable(captured[hook])
     # The hint must ask for markdown: WhatsApp-style *bold* from the model would be converted to italics.
     assert "markdown" in captured["platform_hint"] and "*bold*" not in captured["platform_hint"]
+    # Hermes's standard media sentence, and no leftover "text only" claim.
+    assert "write MEDIA:/absolute/path/to/file in your response" in captured["platform_hint"]
+    assert "Only text" not in captured["platform_hint"]
 
 
 def test_register_kwargs_are_valid_platform_entry_fields():

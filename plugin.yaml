@@ -26,3 +26,6 @@ optional_env:
   - name: WHATSAPP_AGENT_PLATFORM_ALLOW_ALL_USERS
     description: "true to accept any sender Meta delivers (not recommended)"
     password: false
+  - name: WHATSAPP_AGENT_PLATFORM_MEDIA_ENABLED
+    description: "true (default) to receive images, voice notes, audio, video, documents and stickers and to send files; false = text only"
+    password: false

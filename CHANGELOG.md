@@ -5,6 +5,47 @@ All notable changes to this plugin are documented here. Versions follow [SemVer]
 
 ## [Unreleased]
 
+### Added
+- Receive media: photos, voice notes, audio files, videos, documents and stickers are downloaded from Meta's media
+  host (`lookaside.fbsbx.com`, the only host the key is sent to besides the API; no redirects, a byte cap and a
+  sha256 check) into Hermes's media cache and handed to the agent with their caption. Voice notes are transcribed
+  by Hermes speech-to-text; audio files are not. Small UTF-8 text documents are included in the message, a photo
+  sent as a document is treated as a photo, and a sticker arrives as an image. A file that is too large, expired
+  or fails to download reaches the agent as a short note instead, and polling carries on.
+- Quoting an earlier photo or file (yours or the agent's) attaches it again.
+- Send media: `send_image_file`, `send_video`, `send_voice`, `send_document` and `send_image` (image URLs are
+  fetched by Hermes's SSRF-guarded image cache, with the link as fallback). Formats Meta refuses are converted
+  (WebP/GIF/BMP/TIFF/HEIC → PNG/JPEG, oversize photos re-encoded, WAV/FLAC → Ogg/Opus with ffmpeg) or sent as
+  files with a note in the caption; `[[as_document]]` sends the bytes untouched. Captions over 1024 characters go
+  first as text. Uploads wait for Meta's budgets (up to 60 s, with one pacing notice), 429/503 are retried with
+  the same upload, and a send whose outcome is unknown is never retried.
+- Cron / `send_message` attachments without a running gateway: the standalone sender delivers them after the
+  text within 45 s, reports each file it could not send in `warnings`, and sets `media_delivered` only when a
+  file arrived.
+- Reactions from the creator or an allowed sender are forwarded to Hermes hooks (`reaction:added`) and the
+  `gateway_platform_event` plugin hook; they are not answered. Meta delivers new reactions only.
+- `WHATSAPP_AGENT_PLATFORM_MEDIA_ENABLED` (default `true`; `false` = the 0.1 text-only behaviour).
+- The platform hint tells the model how to send files (`MEDIA:/absolute/path`), the types and limits, and what it
+  can receive.
+
+### Changed
+- Media messages are handled instead of being answered with the "I can only read text messages" notice (which
+  remains when media is turned off). Message types Meta hasn't documented get a shorter notice, and both notices
+  now honour `display.platforms.whatsapp_agent_platform.suppress_warning_notifications`.
+- HTTP 409 on sends and read receipts is no longer treated as a poll conflict; only 409 on `GET /updates` is.
+- Cron messages with attachments no longer carry the "attachment(s) generated; not sent from a scheduled job"
+  note (it is kept, reworded, when media is off).
+
+### Security
+- New egress: Meta's media host `lookaside.fbsbx.com` for downloads. The API key goes only there and to
+  `api.whatsapp.com`; other hosts, plain HTTP and redirects are refused.
+- Files the agent sends are uploaded to Meta (kept up to 30 days), and only to the confirmed creator; the check
+  runs before any upload. Received files stay in Hermes's media cache under `HERMES_HOME` (deleted by Hermes after
+  about 24 h while the gateway runs; owner-only on POSIX, best effort).
+- A narrow never-upload list (`.env`, `.env.*`, `*.pem`, SSH private keys, `.git-credentials`, `.netrc`, the
+  plugin's state directory) on top of Hermes's delivery policy; `gateway.strict` is recommended for agents that
+  read untrusted content.
+
 ## [0.1.1] - 2026-09-25
 
 ### Fixed

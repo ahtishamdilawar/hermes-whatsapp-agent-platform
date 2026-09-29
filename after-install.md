@@ -19,3 +19,6 @@
 Only the agent's creator can talk to Hermes: the plugin confirms the creator with Meta before dispatching a
 message. Per WhatsApp's Third-Party Agents Terms, agent chats are **not end-to-end encrypted**: messages pass
 through Meta to this Hermes instance.
+
+You can send your agent photos, voice notes, documents and other files, and it can send files back (up to 16 MB;
+5 MB for photos). Set `WHATSAPP_AGENT_PLATFORM_MEDIA_ENABLED=false` for text only.
