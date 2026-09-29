@@ -154,7 +154,7 @@ python -m venv .venv && . .venv/bin/activate      # Python 3.14 (3.11–3.13 for
 pip install -e ./hermes-agent "pytest==9.1.1" "pytest-asyncio==1.3.0"
 cd hermes-whatsapp-agent-platform
 pytest                                             # protocol, adapter and real-loader tests (fake Meta API)
-hermes plugins validate . && hermes plugins compat . && hermes plugins doctor . --ci
+hermes plugins validate . && hermes plugins doctor . --ci
 ```
 
 `client.py` is the pure `/agent/v1` client (no Hermes imports), `adapter.py` the Hermes glue, `state.py` the

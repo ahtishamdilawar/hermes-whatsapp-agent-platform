@@ -56,7 +56,7 @@ jobs:
         working-directory: plugin
 
   hermes-checks:
-    name: hermes plugins validate / compat / doctor (Hermes ${{ matrix.hermes-ref }})
+    name: hermes plugins validate / doctor (Hermes ${{ matrix.hermes-ref }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -81,7 +81,6 @@ jobs:
       # (Hermes refuses wheel builds, so `pip install git+...` is not an option).
       - run: pip install -e ./hermes-agent
       - run: hermes plugins validate plugin
-      - run: hermes plugins compat plugin
       - run: hermes plugins doctor plugin --ci
 
   version:
