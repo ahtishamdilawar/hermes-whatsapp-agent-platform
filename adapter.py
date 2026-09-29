@@ -1308,44 +1308,157 @@ def _parse_target(ref: str) -> tuple[str, str | None] | None:
     return None
 
 
+STANDALONE_MEDIA_DEADLINE = 45.0  # seconds for text + attachments; Hermes cancels the whole send at 60 s
+
+
+def _standalone_media_paths(media_files: Any) -> list[str]:
+    """Hermes passes ``(path, is_voice)`` tuples; bare paths are tolerated. ``is_voice`` changes nothing here:
+    audio always arrives as a plain attachment on this platform."""
+    paths: list[str] = []
+    for item in media_files or ():
+        path = item[0] if isinstance(item, (list, tuple)) and item else item
+        try:
+            paths.append(os.fspath(path))
+        except TypeError:
+            paths.append("")  # reported as "file not found" by send_media_file
+    return paths
+
+
+def _standalone_kind(path: str) -> str:
+    """The ``send_*`` Hermes's live cron lane would pick, by extension (the media policy then routes by content)."""
+    family = (media.MIME_BY_EXT.get(os.path.splitext(path)[1].lower()) or "").split("/", 1)[0]
+    return {"image": "image", "video": "video", "audio": "voice"}.get(family, "document")
+
+
+def _attachment_label(index: int, total: int, path: str) -> str:
+    """Names an attachment in a warning by position and file name, never by its host path."""
+    name = _DISPLAY_UNSAFE.sub("_", os.path.basename(path.replace("\\", "/")))[:80]
+    return f"attachment {index + 1} of {total}" + (f" ({name})" if name else "")
+
+
+def _standalone_failure(outcome: media_outbound.MediaOutcome) -> str:
+    """A path-free reason for a file ``send_media_file`` did not deliver."""
+    if outcome.refusal is not None:
+        return outcome.refusal
+    if outcome.wait is not None:
+        return f"WhatsApp's send limit is reached (about {max(1, round(outcome.wait))}s to wait)"
+    if outcome.error is not None:
+        if isinstance(outcome.error, (MediaRejected, MediaGone)):
+            return f"media rejected by Meta ({outcome.error.describe()})"
+        return outcome.error.describe()
+    return "caption not sent"
+
+
 async def _standalone_send(
     pconfig: Any,
     chat_id: str,
     message: str,
     *,
     thread_id: str | None = None,
-    media_files: list[str] | None = None,
+    media_files: list[tuple[str, bool]] | list[str] | None = None,
     force_document: bool = False,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """Out-of-process delivery (cron without a running gateway). The agent may message
     its creator first, so no inbound message is needed — only the creator's id, which the
-    gateway records once Meta confirms it (or pass an explicit ``user:<id>``)."""
+    gateway records once Meta confirms it (or pass an explicit ``user:<id>``).
+
+    The text goes first, then each attachment (``(path, is_voice)`` tuples, or bare paths) through the same
+    ``media_outbound.send_media_file`` the gateway uses, with a fresh client and no caption. Attachments go only
+    to the creator Meta confirmed, and no new file is started once ``STANDALONE_MEDIA_DEADLINE`` has passed.
+    Every file not delivered gets a ``warnings`` entry (cron reports those as run errors); ``media_delivered``
+    is set only when at least one file arrived. When nothing at all was delivered the result is an error."""
+    started = time.monotonic()
     key = _api_key()
     if not key:
         return send_error(f"{KEY_ENV} is not set")
+    home = get_hermes_home()
     target = (chat_id or "").strip()
     if target in (SELF_TARGET, ""):
-        to = read_creator(get_hermes_home(), key)
+        to = read_creator(home, key)
     elif _USER_ID_RE.match(target):
         to = target
     else:
         return send_error(f"invalid target {target!r}: use 'self' or user:<id>")
     if not to:
         return send_error(f"recipient unknown: send the agent one WhatsApp message first, or set {HOME_ENV}=user:<id>")
+    paths = _standalone_media_paths(media_files)
+    media_on = _media_enabled(pconfig)
     text = to_whatsapp(message or "")
-    if media_files:
-        text += f"\n\n[{len(media_files)} attachment(s) generated; not sent from a scheduled job]"
+    if paths and not media_on:
+        text += f"\n\n[{len(paths)} attachment(s) not sent: media is turned off for WhatsApp Agent Platform]"
     client = AgentPlatformClient(key, base_url=_base_url())
     sent: list[str] = []
     try:
-        for chunk in _chunks(text):
-            sent.append(await client.send_text(to, chunk))
-        return {"success": True, "message_id": sent[-1] if sent else None}
-    except AgentPlatformError as exc:
-        partial = f" after {len(sent)} of the message's parts were delivered" if sent else ""
-        return send_error(f"{exc.describe()}{partial}")
+        try:
+            for chunk in _chunks(text):
+                sent.append(await client.send_text(to, chunk))
+        except AgentPlatformError as exc:
+            partial = f" after {len(sent)} of the message's parts were delivered" if sent else ""
+            return send_error(f"{exc.describe()}{partial}")
+        if not paths or not media_on:
+            return {"success": True, "message_id": sent[-1] if sent else None}
+        warnings, delivered = await _standalone_media(client, key, home, to, paths, force_document, started)
     finally:
         await client.aclose()
+    if not sent and not delivered:
+        return {**send_error("no attachment could be delivered: " + "; ".join(warnings)), "warnings": warnings}
+    result: dict[str, Any] = {"success": True, "message_id": (delivered or sent)[-1]}
+    if delivered:
+        result["media_delivered"] = True
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
+async def _standalone_media(
+    client: AgentPlatformClient,
+    key: str,
+    home: Any,
+    to: str,
+    paths: list[str],
+    force_document: bool,
+    started: float,
+) -> tuple[list[str], list[str]]:
+    """Send each file; returns (warnings, delivered wamids)."""
+    warnings: list[str] = []
+    delivered: list[str] = []
+    creator = read_creator(home, key)
+    deny_dirs = [str(state_path(home, key).parent)]
+    deadline = started + STANDALONE_MEDIA_DEADLINE
+    for index, path in enumerate(paths):
+        label = _attachment_label(index, len(paths), path)
+        if creator is None or to != creator:
+            # The same rule as the gateway, checked before any upload: Meta delivers only to the creator.
+            warnings.append(f"{label} not sent: media can only be sent to the agent's confirmed creator")
+            continue
+        left = deadline - time.monotonic()
+        if left <= 0:
+            warnings.append(f"{label} not sent: the {STANDALONE_MEDIA_DEADLINE:g}s time limit for this send ran out")
+            continue
+        try:
+            outcome = await media_outbound.send_media_file(
+                client,
+                to,
+                path,
+                requested=_standalone_kind(path),
+                force_document=bool(force_document),
+                transcoder=compat.transcode_to_ogg_opus,
+                deny_dirs=deny_dirs,
+                lock=None,
+                wait_bound=left,
+            )
+        except Exception as exc:  # never lose the text's success over one file
+            logger.warning("%s: scheduled attachment failed (%s)", LABEL, type(exc).__name__)
+            warnings.append(f"{label} not sent: {type(exc).__name__}")
+            continue
+        if outcome.success:
+            delivered.append(outcome.message_id)
+        else:
+            warnings.append(f"{label} not sent: {_standalone_failure(outcome)}")
+    if delivered:
+        logger.info("%s: scheduled send delivered %d of %d attachment(s)", LABEL, len(delivered), len(paths))
+    return warnings, delivered
 
 
 def _interactive_setup() -> None:
