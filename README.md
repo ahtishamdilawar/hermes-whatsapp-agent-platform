@@ -37,7 +37,8 @@ hermes plugins install whatsapp-agent-platform
 ```
 
 This installs the reviewed release pinned in the catalog, then asks whether to enable it (add `--enable` to skip
-the prompt).
+the prompt). To move to a newer release once the catalog pins it, run
+`hermes plugins update whatsapp-agent-platform` and restart the gateway.
 
 Then get your key: in WhatsApp go to **Settings → Agents → Create an agent**, open the agent's chat →
 **Chat info → API key**. Store it with `hermes gateway setup` (choose *WhatsApp Agent Platform*) or add it to
