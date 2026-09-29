@@ -1,0 +1,9 @@
+{
+  "messaging_product": "whatsapp",
+  "to": "user:50972923564215",
+  "type": "image",
+  "image": {
+    "id": "<MEDIA_ID>",
+    "caption": "Check this out!"
+  }
+}

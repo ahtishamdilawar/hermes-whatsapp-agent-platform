@@ -1,0 +1,38 @@
+{
+  "object": "whatsapp_agent_platform",
+  "entry": [
+    {
+      "id": "123456789",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "contacts": [
+              {
+                "wa_id": "user:50972923564215",
+                "profile": { "name": "Alex" }
+              }
+            ],
+            "messages": [
+              {
+                "from": "user:50972923564215",
+                "id": "wamid.HBg...",
+                "timestamp": "1736844652",
+                "type": "audio",
+                "audio": {
+                  "id": "5f637c19-4070-4385-ba83-297373444771",
+                  "mime_type": "audio/ogg",
+                  "sha256": "h2Es2hY3zgogBRD6H18H56MI1WEVYK73ScITHR/3wa4=",
+                  "voice": true
+                }
+              }
+            ],
+            "statuses": []
+          }
+        }
+      ]
+    }
+  ],
+  "next_offset": 1287
+}

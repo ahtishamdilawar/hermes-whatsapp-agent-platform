@@ -1,0 +1,196 @@
+{
+  "upload:gif_static": {
+    "http": 400,
+    "code": 131053,
+    "type": "OAuthException",
+    "message": "(#131053) The declared media type is not one WhatsApp can render",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "image/gif is not a supported media type"
+    }
+  },
+  "upload:gif_animated": {
+    "http": 400,
+    "code": 131053,
+    "type": "OAuthException",
+    "message": "(#131053) The declared media type is not one WhatsApp can render",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "image/gif is not a supported media type"
+    }
+  },
+  "upload:jpeg_5242881B": {
+    "http": 400,
+    "code": 131053,
+    "type": "OAuthException",
+    "message": "(#131053) Media exceeds the upload limit for its declared media type",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "Media is 5242881 bytes, over the 5242880 byte limit for image/jpeg"
+    }
+  },
+  "upload:webp_500001B": {
+    "http": 400,
+    "code": 131053,
+    "type": "OAuthException",
+    "message": "(#131053) Media upload failed",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "The uploaded media was not accepted"
+    }
+  },
+  "upload:text_csv": {
+    "http": 400,
+    "code": 131053,
+    "type": "OAuthException",
+    "message": "(#131053) The declared media type is not one WhatsApp can render",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "text/csv is not a supported media type"
+    }
+  },
+  "upload:text_markdown": {
+    "http": 400,
+    "code": 131053,
+    "type": "OAuthException",
+    "message": "(#131053) The declared media type is not one WhatsApp can render",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "text/markdown is not a supported media type"
+    }
+  },
+  "upload:application_zip": {
+    "http": 400,
+    "code": 131053,
+    "type": "OAuthException",
+    "message": "(#131053) The declared media type is not one WhatsApp can render",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "application/zip is not a supported media type"
+    }
+  },
+  "upload:wav": {
+    "http": 400,
+    "code": 131053,
+    "type": "OAuthException",
+    "message": "(#131053) The declared media type is not one WhatsApp can render",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "audio/wav is not a supported media type"
+    }
+  },
+  "upload:webm": {
+    "http": 400,
+    "code": 131053,
+    "type": "OAuthException",
+    "message": "(#131053) The declared media type is not one WhatsApp can render",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "video/webm is not a supported media type"
+    }
+  },
+  "download_no_auth:jpeg_rgb": {
+    "http": 401,
+    "code": 190,
+    "type": "OAuthException",
+    "message": "Authentication Error"
+  },
+  "download_no_auth:text_plain_md": {
+    "http": 401,
+    "code": 190,
+    "type": "OAuthException",
+    "message": "Authentication Error"
+  },
+  "download_no_auth:mp3": {
+    "http": 401,
+    "code": 190,
+    "type": "OAuthException",
+    "message": "Authentication Error"
+  },
+  "send:webp_as_image": {
+    "http": 400,
+    "code": 131009,
+    "type": "OAuthException",
+    "message": "(#131009) Missing or malformed required fields",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "Media of this content type cannot be sent as the requested message type"
+    }
+  },
+  "send:image_caption_1025": {
+    "http": 400,
+    "code": 100,
+    "type": "OAuthException",
+    "message": "caption"
+  },
+  "send:audio_as_image_mismatch": {
+    "http": 400,
+    "code": 131009,
+    "type": "OAuthException",
+    "message": "(#131009) Missing or malformed required fields",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "Media of this content type cannot be sent as the requested message type"
+    }
+  },
+  "send:bogus_media_id": {
+    "http": 400,
+    "code": 131009,
+    "type": "OAuthException",
+    "message": "(#131009) Missing or malformed required fields",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "No media found for id 0000000000000000"
+    }
+  },
+  "get_after_delete": {
+    "http": 400,
+    "code": 100,
+    "type": "OAuthException",
+    "message": "(#100) No media found for the provided id",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "No media found for this id."
+    }
+  },
+  "download_after_delete": {
+    "http": 404,
+    "code": 100,
+    "type": "OAuthException",
+    "message": "(#100) No media found for the provided id",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "No media found for this id."
+    }
+  },
+  "delete_2": {
+    "http": 400,
+    "code": 100,
+    "type": "OAuthException",
+    "message": "(#100) No media found for the provided id",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "No media found for this id."
+    }
+  },
+  "send_deleted_id": {
+    "http": 400,
+    "code": 131009,
+    "type": "OAuthException",
+    "message": "(#131009) Missing or malformed required fields",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "No media found for id 230d2d0d-3c1c-49f3-a3b8-5a45eafd739f"
+    }
+  },
+  "get_malformed_id": {
+    "http": 400,
+    "code": 100,
+    "type": "OAuthException",
+    "message": "(#100) No media found for the provided id",
+    "error_data": {
+      "messaging_product": "whatsapp",
+      "details": "No media found for this id."
+    }
+  }
+}

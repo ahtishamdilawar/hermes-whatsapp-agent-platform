@@ -55,7 +55,13 @@ def api_key(monkeypatch):
 @pytest.fixture
 def meta(plugin, monkeypatch) -> FakeMeta:
     fake = FakeMeta()
-    monkeypatch.setattr(
-        plugin.adapter, "AgentPlatformClient", lambda key, base_url=None: fake.client(key, unthrottled=True)
-    )
+
+    def make_client(key, base_url=None, **kwargs):
+        # Tolerates constructor kwargs added later (timeouts, allowlists, ...): they reach the real client.
+        if base_url is not None:
+            kwargs["base_url"] = base_url
+        kwargs.pop("http", None)
+        return fake.client(key, unthrottled=True, **kwargs)
+
+    monkeypatch.setattr(plugin.adapter, "AgentPlatformClient", make_client)
     return fake
