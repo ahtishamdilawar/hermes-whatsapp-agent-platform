@@ -832,3 +832,47 @@ async def test_no_url_id_filename_or_caption_in_any_exception(meta):
     assert len(errors) == 16
     for exc in errors:
         assert_clean(exc, SENTINEL)
+
+
+# ------------------------------------------------------------------ Meta's error.message kept on MediaRejected
+
+
+@pytest.mark.parametrize(
+    ("item", "message", "details"),
+    [
+        (meta_error(400, 100, f"context.message_id {SENTINEL}"), f"context.message_id {SENTINEL}", None),
+        (
+            meta_error(400, 131009, f"(#131009) Missing {SENTINEL}", f"Media of this content type {SENTINEL}"),
+            f"(#131009) Missing {SENTINEL}",
+            f"Media of this content type {SENTINEL}",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_media_rejected_keeps_meta_message_but_never_shows_it(meta, item, message, details):
+    meta.queue("messages", item)
+    with pytest.raises(c.MediaRejected) as info:
+        await meta.client().send_media(CREATOR, "image", "abc", reply_to="wamid.old")
+    assert (info.value.error_message, info.value.details) == (message, details)
+    assert_clean(info.value, SENTINEL)
+
+
+@pytest.mark.asyncio
+async def test_upload_rejection_keeps_meta_message(meta):
+    meta.queue("media_upload", meta_error(400, 131053, f"(#131053) not renderable {SENTINEL}", "image/gif is not"))
+    with pytest.raises(c.MediaRejected) as info:
+        await meta.client().upload_media(b"GIF89a", mime="image/gif", filename="a.gif")
+    assert info.value.error_message == f"(#131053) not renderable {SENTINEL}"
+    assert_clean(info.value, SENTINEL)
+
+
+@pytest.mark.asyncio
+async def test_media_rejected_message_is_capped_and_optional(meta):
+    meta.queue("messages", meta_error(400, 100, "m" * 5000), httpx.Response(400, json={"error": {"code": 100}}))
+    api = meta.client()
+    with pytest.raises(c.MediaRejected) as long_message:
+        await api.send_media(CREATOR, "image", "abc")
+    assert len(long_message.value.error_message) == 1024
+    with pytest.raises(c.MediaRejected) as no_message:
+        await api.send_media(CREATOR, "image", "abc")
+    assert no_message.value.error_message is None and no_message.value.details is None

@@ -618,9 +618,38 @@ def test_register_declares_platform_capabilities():
         assert callable(captured[hook])
     # The hint must ask for markdown: WhatsApp-style *bold* from the model would be converted to italics.
     assert "markdown" in captured["platform_hint"] and "*bold*" not in captured["platform_hint"]
-    # Hermes's standard media sentence, and no leftover "text only" claim.
+    # Media is on by default: Hermes's standard media sentence, and no "text only" claim.
+    assert captured["platform_hint"] == mod.PLATFORM_HINT
     assert "write MEDIA:/absolute/path/to/file in your response" in captured["platform_hint"]
-    assert "Only text" not in captured["platform_hint"]
+    assert "text only" not in captured["platform_hint"].lower()
+
+
+def _registered_hint() -> str:
+    captured = {}
+
+    class Ctx:
+        def register_platform(self, **kwargs):
+            captured.update(kwargs)
+
+    mod.register(Ctx())
+    return captured["platform_hint"]
+
+
+@pytest.mark.parametrize("value", ["true", "1", "", " ", "yes"])
+def test_hint_describes_media_when_the_switch_is_on(monkeypatch, value):
+    monkeypatch.setenv(mod.MEDIA_ENV, value)
+    assert _registered_hint() == mod.PLATFORM_HINT
+
+
+@pytest.mark.parametrize("value", ["false", "0", "no", "off", " FALSE "])
+def test_hint_is_text_only_when_the_switch_is_off(monkeypatch, value):
+    """The switch as the adapter parses it (``_media_enabled``); the model is not told it can send files."""
+    monkeypatch.setenv(mod.MEDIA_ENV, value)
+    hint = _registered_hint()
+    assert hint == mod.TEXT_ONLY_PLATFORM_HINT
+    assert hint.startswith(mod.HINT_BASE) and mod.PLATFORM_HINT.startswith(mod.HINT_BASE)
+    assert "MEDIA:" not in hint and "[[as_document]]" not in hint and "text only" in hint
+    assert "markdown" in hint and "*bold*" not in hint
 
 
 def test_register_kwargs_are_valid_platform_entry_fields():

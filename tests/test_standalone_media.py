@@ -7,6 +7,7 @@ contract checked here: ``media_delivered`` only when a file arrived, one ``warni
 
 from __future__ import annotations
 
+import asyncio
 import time
 from types import SimpleNamespace
 
@@ -252,3 +253,80 @@ async def test_through_hermes_send_to_platform(meta, creator, tmp_path, monkeypa
     missing = (str(tmp_path / "gone.pdf"), False)
     result = await send_to_platform(Platform(mod.PLATFORM_NAME), pconfig, "self", "report", media_files=[missing])
     assert result["success"] is True and any("gone.pdf" in w for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_media_only_job_whose_upload_fails_is_an_error(meta, creator, tmp_path):
+    from wap_helpers import unsupported_mime_response
+
+    meta.queue("media_upload", unsupported_mime_response("image/png"))
+    result = await mod._standalone_send(None, "self", "", media_files=[(put(tmp_path, "a.png", sample_png()), False)])
+    assert not result.get("success") and result.get("error")
+    assert "media_delivered" not in result
+    assert len(result["warnings"]) == 1 and "a.png" in result["warnings"][0] and "rejected" in result["warnings"][0]
+    assert_path_free(result, tmp_path)
+    assert len(meta.calls("media_upload")) == 1 and meta.calls("messages") == []
+
+
+def slow(meta, handler, seconds: float = 5.0):
+    """An async FakeMeta handler that stalls (without blocking the loop), then answers normally."""
+
+    async def stalled(request):
+        await asyncio.sleep(seconds)
+        return handler(request)
+
+    return stalled
+
+
+@pytest.mark.asyncio
+async def test_deadline_cancels_a_media_message_in_flight_and_reports_outcome_unknown(
+    meta, creator, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(mod, "STANDALONE_MEDIA_DEADLINE", 0.5)
+    meta.queue("messages", meta._messages, slow(meta, meta._messages))  # the text, then the first file stalls
+    files = [(put(tmp_path, f"{n}.png", sample_png()), False) for n in "ab"]
+    started = time.monotonic()
+    result = await mod._standalone_send(None, "self", "report", media_files=files)
+    assert time.monotonic() - started < 3  # returned at the deadline, not after the stalled send
+    assert result["success"] is True and "media_delivered" not in result  # the text arrived
+    first, second = result["warnings"]
+    assert first.startswith("attachment 1 of 2 (a.png): outcome unknown") and "may have arrived" in first
+    assert second.startswith("attachment 2 of 2 (b.png) not sent") and "time limit" in second
+    assert len(meta.calls("media_upload")) == 1
+    assert_path_free(result, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_deadline_cancels_an_upload_in_flight_and_reports_the_file_not_sent(meta, creator, tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "STANDALONE_MEDIA_DEADLINE", 0.5)
+    meta.queue("media_upload", slow(meta, meta._upload))
+    started = time.monotonic()
+    result = await mod._standalone_send(None, "self", "", media_files=[(put(tmp_path, "a.pdf", sample_pdf()), False)])
+    assert time.monotonic() - started < 3
+    assert not result.get("success") and result.get("error") and "media_delivered" not in result
+    [warning] = result["warnings"]
+    assert warning.startswith("attachment 1 of 1 (a.pdf) not sent") and "time limit" in warning
+    assert "outcome unknown" not in warning
+    assert meta.calls("messages") == []
+
+
+@pytest.mark.asyncio
+async def test_standalone_logs_never_carry_paths_or_names(meta, creator, tmp_path, caplog):
+    import logging
+
+    from wap_helpers import unsupported_mime_response
+
+    caplog.set_level(logging.DEBUG)
+    meta.queue("media_upload", unsupported_mime_response("image/png"))
+    files = [
+        (put(tmp_path / "zzHOSTDIRzz", "zzNAMEzz.png", sample_png()), False),
+        (str(tmp_path / "zzHOSTDIRzz" / "zzNAMEzz-gone.pdf"), False),
+        (put(tmp_path / "zzHOSTDIRzz", ".env", b"K=1\n"), False),
+    ]
+    result = await mod._standalone_send(None, "self", "report", media_files=files)
+    assert len(result["warnings"]) == 3
+    plugin_logs = [r.getMessage() for r in caplog.records if r.name.startswith("wap_plugin_under_test")]
+    assert plugin_logs
+    for text in plugin_logs:
+        for secret in (str(tmp_path), "zzHOSTDIRzz", "zzNAMEzz", *(u.media_id for u in meta.uploads)):
+            assert secret not in text, (secret, text)

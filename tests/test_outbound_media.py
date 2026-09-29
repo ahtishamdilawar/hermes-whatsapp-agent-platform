@@ -548,14 +548,53 @@ async def test_base_send_multiple_images_sends_each_through_send_image_file(ad, 
 
 
 @pytest.mark.asyncio
-async def test_switch_off_restores_base_behaviour(ad, meta, tmp_path):
+async def test_switch_off_file_sends_fail_final_and_url_images_go_as_links(ad, meta, tmp_path):
     ad._media_enabled = False
-    await ad.send_document(CREATOR, put(tmp_path, "a.pdf", sample_pdf()))
-    await ad.send_image(CREATOR, "https://example.com/a.png")
-    assert meta.uploads == [] and meta.sent_media == []
-    bodies = meta.bodies("messages")
-    assert [b["type"] for b in bodies] == ["text", "text"]  # base's notice, then the link
-    assert bodies[1]["text"]["body"] == "https://example.com/a.png"
+    png, pdf = put(tmp_path, "a.png", sample_png()), put(tmp_path, "a.pdf", sample_pdf())
+    results = [
+        await ad.send_image_file(CREATOR, png, caption="c"),
+        await ad.send_video(CREATOR, put(tmp_path, "a.mp4", sample_mp4())),
+        await ad.send_voice(CREATOR, put(tmp_path, "a.mp3", sample_mp3()), is_voice=True),
+        await ad.send_document(CREATOR, pdf, caption="c", file_name="r.pdf"),
+    ]
+    for result in results:  # never a notice reported as success (the send_message tool trusted that)
+        assert not result.success and result.error == mod.MEDIA_OFF_ERROR
+        assert result.retryable is False and result.raw_response["final"]
+        assert "forbidden" not in result.error and "flood" not in result.error
+    assert meta.calls("messages") == [] and meta.calls("media_upload") == []
+    link = await ad.send_image(CREATOR, "https://example.com/a.png", caption="alt")
+    assert link.success and meta.uploads == []  # the link as text is real content, as in v0.1.x
+    assert [b["text"]["body"] for b in meta.bodies("messages")] == ["alt\nhttps://example.com/a.png"]
+
+
+@pytest.mark.asyncio
+async def test_switch_off_hermes_callers_report_the_failure(ad, meta, tmp_path):
+    """The send_message tool reports the file as not sent; the reply path records failures and posts its own
+    "couldn't deliver" notice for the non-image file (one text message, no upload)."""
+    send_message_tool = pytest.importorskip("tools.send_message_tool")
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+
+    ad._media_enabled = False
+    pdf, png = put(tmp_path, "report.pdf", sample_pdf()), put(tmp_path, "chart.png", sample_png())
+    tool = await send_message_tool._send_live_adapter_media(ad, CREATOR, "here", [(pdf, False)])
+    assert "error" in tool and not tool.get("success") and "media_delivered" not in tool
+    assert meta.calls("messages") == []
+
+    event = MessageEvent(text="", source=SessionSource(platform=Platform(mod.PLATFORM_NAME), chat_id=CREATOR))
+    recorded = []
+    await ad._deliver_media_attachments(
+        event,
+        [(png, False), (pdf, False)],
+        [],
+        force_document_attachments=False,
+        human_delay=0.0,
+        metadata={},
+        record_delivery=recorded.append,
+    )
+    assert len(recorded) == 2 and not any(r.success for r in recorded)
+    assert message_types(meta) == ["text"] and meta.uploads == []  # Hermes's notice for the PDF only
 
 
 @pytest.mark.asyncio
@@ -591,3 +630,330 @@ async def test_pacing_notice_is_skipped_when_the_messages_budget_is_the_wait(ad,
     result = await ad.send_image_file(CREATOR, put(tmp_path, "a.png", sample_png()))
     assert result.success and message_types(meta) == ["image"]
     assert time.monotonic() - started >= 0.1
+
+
+# ------------------------------------------------------------------ Meta refuses the recipient after the upload
+@pytest.mark.asyncio
+async def test_media_message_403_after_upload_is_forbidden_final_and_not_retried(ad, meta, tmp_path):
+    meta.queue("messages", error_response(403, 131005))
+    result = await ad.send_image_file(CREATOR, put(tmp_path, "a.png", sample_png()), caption="c")
+    assert not result.success and result.error.startswith("forbidden") and result.error_kind == "forbidden"
+    assert result.raw_response["final"]
+    assert len(meta.calls("media_upload")) == 1 and len(meta.calls("messages")) == 1
+
+
+@pytest.mark.asyncio
+async def test_known_non_creator_is_refused_in_the_media_precheck(ad, meta, tmp_path, monkeypatch):
+    fetch = AsyncMock()
+    monkeypatch.setattr(hermes_compat, "cache_image_from_url", fetch)
+    ad._non_creators.add(CREATOR)  # Meta answered 403 for this id before, even though it is the pinned creator
+    results = [
+        await ad.send_document(CREATOR, put(tmp_path, "a.pdf", sample_pdf())),
+        await ad.send_image(CREATOR, "https://example.com/a.png"),
+    ]
+    assert all(not r.success and r.error.startswith("forbidden") for r in results)
+    fetch.assert_not_awaited()
+    assert meta.calls("media_upload") == [] and meta.calls("messages") == []
+
+
+# ------------------------------------------------------------------ send_image(url): when the link may be sent
+URL = "https://example.com/pics/a.png"
+
+
+def fetched(monkeypatch, path: str) -> AsyncMock:
+    fetch = AsyncMock(return_value=path)
+    monkeypatch.setattr(hermes_compat, "cache_image_from_url", fetch)
+    return fetch
+
+
+def link_messages(meta) -> list[dict]:
+    return [b for b in meta.bodies("messages") if b["type"] == "text" and URL in b["text"]["body"]]
+
+
+def full_messages_window(ad) -> None:
+    ad._media_wait_bound = 1.0
+    ad._client.limits["messages"] = window = RateWindow(1, window=60)
+    window.try_acquire()
+
+
+@pytest.mark.parametrize(
+    ("case", "expect_error"),
+    [
+        ("forbidden", "forbidden"),  # a 403 after the upload: the link would be refused the same way
+        ("ambiguous", "outcome unknown"),  # the image may have arrived: a link could duplicate it
+        ("budget", "flood_control:"),  # Hermes retries a flood-controlled send; a link now would duplicate
+        ("caption_text", "outcome unknown"),  # the caption text itself failed: nothing more is sent
+    ],
+)
+@pytest.mark.asyncio
+async def test_send_image_url_never_falls_back_when_the_image_may_arrive_or_would_be_refused(
+    ad, meta, tmp_path, monkeypatch, case, expect_error
+):
+    fetched(monkeypatch, put(tmp_path, "cache/img_1.jpg", sample_png()))
+    caption = "c"
+    if case == "forbidden":
+        meta.queue("messages", error_response(403, 131005))
+    elif case == "ambiguous":
+        meta.queue("messages", error_response(500, 2))
+    elif case == "budget":
+        full_messages_window(ad)
+    else:
+        caption = "x" * 1100  # over 1024: goes first as its own text, which then fails
+        meta.queue("messages", error_response(500, 2))
+    result = await ad.send_image(CREATOR, URL, caption=caption)
+    assert not result.success and result.error.startswith(expect_error)
+    assert link_messages(meta) == []
+    if case == "caption_text":
+        assert meta.sent_media == [] and message_types(meta) == ["text"]
+    elif case == "budget":
+        assert meta.calls("messages") == [] and meta.calls("media_upload") == []
+    else:
+        assert message_types(meta) == ["image"]  # exactly one media POST, no retry
+
+
+@pytest.mark.parametrize("stage", ["upload", "message", "media_gone"])
+@pytest.mark.asyncio
+async def test_send_image_url_falls_back_to_the_link_when_meta_rejects_the_image(
+    ad, meta, tmp_path, monkeypatch, stage
+):
+    fetched(monkeypatch, put(tmp_path, "cache/img_1.jpg", sample_png()))
+    if stage == "upload":
+        meta.queue("media_upload", unsupported_mime_response("image/png"))
+    elif stage == "message":
+        meta.queue("messages", media_type_mismatch_response())
+    else:
+        meta.queue("messages", no_media_found_send_response("a"), no_media_found_send_response("b"))
+    result = await ad.send_image(CREATOR, URL, caption="alt", reply_to="wamid.in1")
+    assert result.success
+    [link] = link_messages(meta)
+    assert link["text"]["body"] == f"alt\n{URL}" and link["context"] == {"message_id": "wamid.in1"}
+    assert meta.sent_media == []
+
+
+@pytest.mark.asyncio
+async def test_send_image_url_fallback_after_the_caption_went_as_text_does_not_repeat_it(
+    ad, meta, tmp_path, monkeypatch
+):
+    fetched(monkeypatch, put(tmp_path, "cache/img_1.jpg", sample_png()))
+    meta.queue("messages", meta._messages, media_type_mismatch_response())  # caption text OK, image rejected
+    caption = "y" * 1100
+    result = await ad.send_image(CREATOR, URL, caption=caption, reply_to="wamid.in1")
+    assert result.success
+    bodies = meta.bodies("messages")
+    assert [b["type"] for b in bodies] == ["text", "image", "text"]
+    assert bodies[0]["text"]["body"] == caption and bodies[0]["context"] == {"message_id": "wamid.in1"}
+    assert bodies[2]["text"]["body"] == URL and "context" not in bodies[2]  # the link alone, once
+
+
+@pytest.mark.parametrize("kind", ["empty", "missing"])
+@pytest.mark.asyncio
+async def test_send_image_url_falls_back_when_the_fetched_file_cannot_be_prepared(
+    ad, meta, tmp_path, monkeypatch, kind
+):
+    path = put(tmp_path, "cache/img_1.jpg", b"") if kind == "empty" else str(tmp_path / "cache" / "gone.jpg")
+    fetched(monkeypatch, path)
+    result = await ad.send_image(CREATOR, URL, caption="alt")
+    assert result.success and meta.uploads == []
+    assert [b["text"]["body"] for b in meta.bodies("messages")] == [f"alt\n{URL}"]
+
+
+@pytest.mark.asyncio
+async def test_send_image_url_fetch_is_bounded_in_time(ad, meta, monkeypatch):
+    import asyncio
+
+    async def hang(url):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(hermes_compat, "cache_image_from_url", hang)
+    ad._media_url_timeout = 0.05
+    started = time.monotonic()
+    result = await ad.send_image(CREATOR, URL)
+    assert time.monotonic() - started < 5
+    assert result.success and meta.uploads == [] and [b["text"]["body"] for b in meta.bodies("messages")] == [URL]
+
+
+@pytest.mark.asyncio
+async def test_send_image_url_over_16_mib_is_dropped_and_sent_as_a_link(ad, meta, tmp_path, monkeypatch):
+    path = tmp_path / "cache" / "img_big.jpg"
+    path.parent.mkdir()
+    with open(path, "wb") as fh:
+        fh.write(sample_jpeg())
+        fh.truncate(mod.URL_IMAGE_MAX_BYTES + 1)
+    fetched(monkeypatch, str(path))
+    result = await ad.send_image(CREATOR, URL)
+    assert result.success and meta.uploads == [] and not path.exists()
+    assert [b["text"]["body"] for b in meta.bodies("messages")] == [URL]
+
+
+@pytest.mark.parametrize(
+    "url", ["http://127.0.0.1:1/x.png", "http://10.0.0.1/x.png", "http://169.254.169.254/latest/meta.png"]
+)
+@pytest.mark.asyncio
+async def test_send_image_url_real_ssrf_guard_refuses_internal_hosts(ad, meta, monkeypatch, url):
+    """Hermes's own ``cache_image_from_url`` (not patched) refuses the URL; the link goes as text instead."""
+    import httpx
+
+    real_send = httpx.AsyncClient.send
+    reached = []
+
+    async def guarded_send(self, request, *args, **kwargs):
+        if request.url.host in ("127.0.0.1", "10.0.0.1", "169.254.169.254"):
+            reached.append(str(request.url))
+            raise AssertionError("an internal URL was requested")
+        return await real_send(self, request, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", guarded_send)
+    assert hermes_compat.cache_image_from_url.__module__ == "gateway.platforms.base"
+    result = await ad.send_image(CREATOR, url)
+    assert result.success and reached == [] and meta.uploads == []
+    assert [b["text"]["body"] for b in meta.bodies("messages")] == [url]
+    assert {h.host for h in meta.host_log} == {"api.whatsapp.com"}
+
+
+# ------------------------------------------------------------------ batches
+@pytest.mark.asyncio
+async def test_send_multiple_images_with_one_failure_is_still_a_success(ad, meta, tmp_path):
+    paths = [put(tmp_path, "a.png", sample_png()), str(tmp_path / "gone.png"), put(tmp_path, "c.png", sample_png())]
+    result = await ad.send_multiple_images(CREATOR, [(f"file://{quote(p)}", "") for p in paths])
+    assert result.success  # Hermes's rule: at least one image delivered
+    assert [s.type for s in meta.sent_media] == ["image", "image"] and len(meta.uploads) == 2
+    assert message_types(meta) == ["image", "image"]  # Hermes's image batch posts no failure notice
+
+
+# ------------------------------------------------------------------ pacing notice wording
+@pytest.mark.asyncio
+async def test_pacing_notice_says_more_files_only_when_more_are_waiting(ad, meta, tmp_path):
+    import asyncio
+
+    ad._media_pacing_after, ad._media_wait_bound, ad._media_pacing_interval = 0.05, 5.0, 0.0
+    ad._client.limits["media_upload"] = window = RateWindow(1, window=0.2)
+    window.try_acquire()
+    assert (await ad.send_image_file(CREATOR, put(tmp_path, "one.png", sample_png()))).success
+    notices = [b["text"]["body"] for b in meta.bodies("messages") if b["type"] == "text"]
+    assert len(notices) == 1 and "More files" not in notices[0] and "A file is on its way" in notices[0]
+
+    await asyncio.sleep(0.25)
+    window.try_acquire()
+    paths = [put(tmp_path, f"{i}.png", sample_png()) for i in range(2)]
+    results = await asyncio.gather(*(ad.send_image_file(CREATOR, p) for p in paths))
+    assert all(r.success for r in results)
+    notices = [b["text"]["body"] for b in meta.bodies("messages") if b["type"] == "text"]
+    assert any("More files coming" in n for n in notices[1:])
+
+
+# ------------------------------------------------------------------ stale quote named only in Meta's message
+def stale_quote_message_only_response(message: str = "context.message_id"):
+    """Hypothetical shape (not yet seen live): code 100 naming the field in ``message`` with no ``error_data``,
+    the way Meta answered the live 1025-unit caption (``message: "caption"``). P6 records the real one."""
+    from wap_helpers import meta_error
+
+    return meta_error(400, 100, message)
+
+
+@pytest.mark.parametrize("message", ["context.message_id", "context", "(#100) Param context[message_id] is invalid"])
+@pytest.mark.asyncio
+async def test_stale_quote_named_only_in_the_message_is_resent_without_it(ad, meta, tmp_path, message):
+    meta.queue("messages", stale_quote_message_only_response(message))
+    result = await ad.send_image_file(CREATOR, put(tmp_path, "a.png", sample_png()), reply_to="wamid.old")
+    assert result.success
+    first, second = meta.bodies("messages")
+    assert first["context"] == {"message_id": "wamid.old"} and "context" not in second
+    assert first["image"]["id"] == second["image"]["id"] and len(meta.uploads) == 1
+
+
+def test_is_stale_media_quote_is_conservative():
+    from wap_plugin_under_test.client import MediaRejected, NotSent
+
+    def rejected(message=None, details=None, status=400):
+        return MediaRejected("send: rejected", status=status, code=100, details=details, error_message=message)
+
+    assert media_outbound.is_stale_media_quote(rejected("context.message_id"))
+    assert media_outbound.is_stale_media_quote(rejected(details="context.message_id is not a wamid from this chat"))
+    assert media_outbound.is_stale_media_quote(rejected("message_id"))
+    for message, details in [
+        ("caption", None),  # live shape for a long caption
+        ("(#100) Invalid parameter", None),
+        ("(#131009) Missing or malformed required fields", "No media found for id wamid-like-id"),
+        ("(#100) No media found for the provided id", "No media found for this id."),
+        ("Invalid value in this context, try again", None),
+        (None, None),
+    ]:
+        assert not media_outbound.is_stale_media_quote(rejected(message, details)), (message, details)
+    assert not media_outbound.is_stale_media_quote(rejected("context", status=500))
+    assert not media_outbound.is_stale_media_quote(NotSent("context.message_id", status=400, code=100))
+
+
+# ------------------------------------------------------------------ outbound log hygiene
+@pytest.mark.asyncio
+async def test_outbound_logs_and_errors_never_carry_paths_names_captions_ids_or_urls(
+    ad, meta, tmp_path, monkeypatch, caplog
+):
+    import logging
+
+    secret_dir = tmp_path / "zzHOSTDIRzz"
+    name = "zzFILENAMEzz"
+    caption = "zzCAPTIONzz " * 3
+    url = "https://example.com/zzURLzz.png"
+    caplog.set_level(logging.DEBUG)
+    results = []
+
+    async def run(coro):
+        results.append(await coro)
+
+    png = put(secret_dir, f"{name}.png", sample_png())
+    await run(ad.send_image_file(CREATOR, png, caption=caption))  # success
+    await run(ad.send_document(CREATOR, str(secret_dir / f"{name}-missing.pdf"), caption=caption))
+    await run(ad.send_document(CREATOR, put(secret_dir, ".env", b"K=1\n")))
+    await run(ad.send_document(CREATOR, put(secret_dir, f"{name}-empty.pdf", b"")))
+    big = secret_dir / f"{name}-big.zip"
+    with open(big, "wb") as fh:
+        fh.truncate(16 * MIB + 1)
+    await run(ad.send_document(CREATOR, str(big)))
+    meta.queue("media_upload", unsupported_mime_response("image/png"))
+    await run(ad.send_image_file(CREATOR, png, caption=caption))
+    meta.queue("messages", no_media_found_send_response("zzMEDIAIDzz"), no_media_found_send_response("zzMEDIAIDzz"))
+    await run(ad.send_image_file(CREATOR, png, caption=caption))
+    await run(ad.send_image_file(CREATOR, png, caption=caption + "x" * 1100))  # caption overflow, then the file
+    meta.queue("messages", error_response(403, 131005))
+    await run(ad.send_document(CREATOR, put(secret_dir, f"{name}.pdf", sample_pdf()), caption=caption))
+    meta.queue("messages", error_response(500, 2))
+    await run(ad.send_image_file(CREATOR, png, caption=caption))
+    monkeypatch.setattr(hermes_compat, "cache_image_from_url", AsyncMock(side_effect=ValueError(f"unsafe {url}")))
+    await run(ad.send_image(CREATOR, url, caption=caption))
+    monkeypatch.setattr(hermes_compat, "cache_image_from_url", AsyncMock(return_value=png))
+    meta.queue("messages", media_type_mismatch_response())
+    await run(ad.send_image(CREATOR, url, caption=caption))
+    ad._non_creators.add(CREATOR)
+    await run(ad.send_document(CREATOR, png, caption=caption))
+
+    assert any(not r.success for r in results) and any(r.success for r in results)
+    secrets = [str(tmp_path), "zzHOSTDIRzz", name, "zzCAPTIONzz", "zzURLzz", "zzMEDIAIDzz", "example.com"]
+    secrets += [u.media_id for u in meta.uploads]
+    plugin_logs = [r.getMessage() for r in caplog.records if r.name.startswith("wap_plugin_under_test")]
+    assert plugin_logs  # the paths above do log
+    for text in plugin_logs + [r.error or "" for r in results]:
+        for secret in secrets:
+            assert secret not in text, (secret, text)
+
+
+# ------------------------------------------------------------------ plugin-wide rule (09 M1)
+def test_no_plugin_module_uses_cache_media_bytes():
+    """``CachedMedia.path`` changed meaning on Hermes main, so no plugin module may reference the helper
+    (docstrings may mention it)."""
+    root = Path(mod.__file__).parent
+    banned = {"cache_media_bytes", "cache_media_bytes_async"}
+    modules = sorted(root.glob("*.py"))
+    assert {"adapter.py", "hermes_compat.py", "media_outbound.py"} <= {m.name for m in modules}
+    for module in modules:
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        used = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                used.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                used.add(node.attr)
+            elif isinstance(node, ast.alias):
+                used.update({node.name.rsplit(".", 1)[-1], node.asname or ""})
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.strip() in banned:
+                used.add(node.value.strip())  # getattr(base, "cache_media_bytes")
+        assert not used & banned, module.name

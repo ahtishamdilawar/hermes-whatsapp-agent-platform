@@ -1138,9 +1138,20 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
     _media_pacing_after = media_outbound.PACING_NOTICE_AFTER
     _media_retry_backoff = media_outbound.RETRY_BACKOFF
     _media_pacing_interval = 60.0  # at most one pacing notice per recipient per window
+    _media_url_timeout = 60.0  # seconds for Hermes's download of an image URL (send_image), then the link
 
     def _media_on(self) -> bool:
         return bool(getattr(self, "_media_enabled", True))
+
+    @staticmethod
+    def _media_off_result() -> SendResult:
+        """Media switched off: a final failure, never a notice reported as success. Hermes's reply path then
+        adds its own "couldn't deliver" notice for non-image files, and the send_message tool and cron's live
+        lane report the file as not sent (as v0.1.x did, where these methods were not overridden)."""
+        logger.info("%s: attachment not sent: media is turned off", LABEL)
+        return SendResult(
+            success=False, error=MEDIA_OFF_ERROR, retryable=False, error_kind="unknown", raw_response={"final": True}
+        )
 
     async def send_image_file(
         self,
@@ -1152,9 +1163,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> SendResult:
         if not self._media_on():
-            return await super().send_image_file(
-                chat_id, image_path, caption=caption, reply_to=reply_to, metadata=metadata, **kwargs
-            )
+            return self._media_off_result()
         return (await self._send_media(chat_id, image_path, "image", caption, reply_to, metadata, kwargs))[0]
 
     async def send_video(
@@ -1167,9 +1176,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> SendResult:
         if not self._media_on():
-            return await super().send_video(
-                chat_id, video_path, caption=caption, reply_to=reply_to, metadata=metadata, **kwargs
-            )
+            return self._media_off_result()
         return (await self._send_media(chat_id, video_path, "video", caption, reply_to, metadata, kwargs))[0]
 
     async def send_voice(
@@ -1184,9 +1191,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         """Audio always arrives as a plain attachment on this platform (no voice bubble), so ``is_voice`` is
         ignored; a caption goes first as text, because audio takes none."""
         if not self._media_on():
-            return await super().send_voice(
-                chat_id, audio_path, caption=caption, reply_to=reply_to, metadata=metadata, **kwargs
-            )
+            return self._media_off_result()
         return (await self._send_media(chat_id, audio_path, "voice", caption, reply_to, metadata, kwargs))[0]
 
     async def send_document(
@@ -1201,9 +1206,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """The bytes go unmodified as a document (Hermes routes ``[[as_document]]`` files here)."""
         if not self._media_on():
-            return await super().send_document(
-                chat_id, file_path, caption=caption, file_name=file_name, reply_to=reply_to, metadata=metadata, **kwargs
-            )
+            return self._media_off_result()
         kwargs["file_name"] = file_name
         return (await self._send_media(chat_id, file_path, "document", caption, reply_to, metadata, kwargs))[0]
 
@@ -1216,23 +1219,48 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> SendResult:
-        """Fetch the URL with Hermes's SSRF-guarded image cache, then send it like a local image. Any fetch
-        failure, or a send that certainly did not deliver, falls back to the base behaviour (the link as
-        text). The URL itself is never fetched by the plugin."""
+        """Fetch the URL with Hermes's SSRF-guarded image cache (bounded in time and size), then send it like a
+        local image. The link goes as text (the base behaviour) only when the image certainly did not arrive:
+        the fetch failed, the file was refused before its upload, or Meta rejected it. After a send that may
+        have delivered it (outcome unknown), a refused recipient (forbidden), a send-limit wait (flood_control)
+        or a failed caption text, that result is returned as is: a link could duplicate the image, or would be
+        refused the same way. A caption that already went as its own text is not repeated with the link. The
+        plugin itself never requests the URL. With media off the link goes as text, as in v0.1.x."""
         if not self._media_on():
             return await super().send_image(chat_id, image_url, caption=caption, reply_to=reply_to, metadata=metadata)
         refused = self._media_precheck(chat_id)
         if refused is not None:
             return refused
-        try:
-            path = await compat.cache_image_from_url(image_url)
-        except Exception as exc:
-            logger.info("%s: image URL not fetched (%s); sending it as a link", LABEL, type(exc).__name__)
+        path = await self._fetch_image_url(image_url)
+        if path is None:
             return await super().send_image(chat_id, image_url, caption=caption, reply_to=reply_to, metadata=metadata)
         result, outcome = await self._send_media(chat_id, path, "image", caption, reply_to, metadata, {})
         if result.success or not self._media_certainly_unsent(outcome):
             return result
+        logger.info("%s: image from a URL not sent; sending its link instead", LABEL)
+        if outcome is not None and outcome.caption_sent:  # the caption (with the quote) is already in the chat
+            return await super().send_image(chat_id, image_url, caption=None, reply_to=None, metadata=metadata)
         return await super().send_image(chat_id, image_url, caption=caption, reply_to=reply_to, metadata=metadata)
+
+    async def _fetch_image_url(self, url: str) -> str | None:
+        """Hermes's SSRF-guarded download into its image cache, bounded to ``_media_url_timeout`` seconds and
+        ``URL_IMAGE_MAX_BYTES``. None when it failed; the caller then sends the link."""
+        try:
+            path = await asyncio.wait_for(compat.cache_image_from_url(url), self._media_url_timeout)
+        except Exception as exc:  # SSRF refusal, HTTP error, time limit, not an image, over Hermes's own cap
+            logger.info("%s: image URL not fetched (%s); sending it as a link", LABEL, type(exc).__name__)
+            return None
+        try:
+            size = os.path.getsize(path)
+        except (OSError, TypeError, ValueError) as exc:
+            logger.info("%s: fetched image unreadable (%s); sending it as a link", LABEL, type(exc).__name__)
+            return None
+        if size > URL_IMAGE_MAX_BYTES:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+            logger.info("%s: image URL too large (%d bytes); sending it as a link", LABEL, size)
+            return None
+        return path
 
     def _media_precheck(self, chat_id: str) -> SendResult | None:
         """Before any fetch or upload: a live client and a recipient Meta will deliver to (only the creator)."""
@@ -1260,12 +1288,15 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _media_certainly_unsent(outcome: media_outbound.MediaOutcome | None) -> bool:
+        """The image certainly did not arrive and a link cannot duplicate it: refused before the upload
+        (unreadable, too big, not preparable) or refused by Meta (``MediaRejected``, or ``MediaGone`` after the
+        one re-upload). Never after an outcome unknown, a forbidden recipient, a send-limit wait or a caption
+        text that failed."""
         if outcome is None or outcome.text_failure is not None or outcome.wait is not None:
             return False
         if outcome.refusal is not None:
             return True
-        exc = outcome.error
-        return isinstance(exc, NotSent) and not isinstance(exc, (NotCreatorError, AuthError))
+        return isinstance(outcome.error, (MediaRejected, MediaGone))
 
     def _media_deny_dirs(self) -> list[str]:
         """The plugin's own state directory is never uploaded (on top of ``media.is_denied_path``'s names)."""
@@ -1299,25 +1330,32 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         async def pacing(wait: float) -> None:
             await self._media_pacing_notice(chat_id, to, wait, metadata)
 
-        outcome = await media_outbound.send_media_file(
-            client,
-            to,
-            path,
-            requested=requested,
-            caption=caption,
-            reply_to=reply_to,
-            file_name=kwargs.get("file_name"),
-            force_document=requested == "document" or bool(kwargs.get("force_document")),
-            transcoder=compat.transcode_to_ogg_opus,
-            deny_dirs=self._media_deny_dirs(),
-            lock=self._send_lock,
-            send_text=caption_text,
-            notify_pacing=pacing,
-            note_filter=self._media_note,
-            wait_bound=self._media_wait_bound,
-            pacing_after=self._media_pacing_after,
-            retry_backoff=self._media_retry_backoff,
-        )
+        pending: collections.Counter[str] = self.__dict__.setdefault("_media_pending", collections.Counter())
+        pending[to] += 1  # files in progress for this recipient: the pacing notice says "more files" only if > 1
+        try:
+            outcome = await media_outbound.send_media_file(
+                client,
+                to,
+                path,
+                requested=requested,
+                caption=caption,
+                reply_to=reply_to,
+                file_name=kwargs.get("file_name"),
+                force_document=requested == "document" or bool(kwargs.get("force_document")),
+                transcoder=compat.transcode_to_ogg_opus,
+                deny_dirs=self._media_deny_dirs(),
+                lock=self._send_lock,
+                send_text=caption_text,
+                notify_pacing=pacing,
+                note_filter=self._media_note,
+                wait_bound=self._media_wait_bound,
+                pacing_after=self._media_pacing_after,
+                retry_backoff=self._media_retry_backoff,
+            )
+        finally:
+            pending[to] -= 1
+            if pending[to] <= 0:
+                del pending[to]
         return await self._media_result(outcome, to), outcome
 
     async def _media_result(self, outcome: media_outbound.MediaOutcome, to: str) -> SendResult:
@@ -1375,7 +1413,11 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             return
         sent_at[to] = now
         seconds = max(1, round(wait))
-        await emit(chat_id, f"(More files coming: pausing ~{seconds}s for WhatsApp's send limit.)", metadata=metadata)
+        if self.__dict__.get("_media_pending", {}).get(to, 0) > 1:
+            text = f"(More files coming: pausing ~{seconds}s for WhatsApp's send limit.)"
+        else:
+            text = f"(A file is on its way: pausing ~{seconds}s for WhatsApp's send limit.)"
+        await emit(chat_id, text, metadata=metadata)
 
     # ----------------------------------------------------------- read / typing
     def _note_status(self, wamid: str) -> None:
@@ -1442,6 +1484,8 @@ def _parse_target(ref: str) -> tuple[str, str | None] | None:
 
 
 STANDALONE_MEDIA_DEADLINE = 45.0  # seconds for text + attachments; Hermes cancels the whole send at 60 s
+URL_IMAGE_MAX_BYTES = media.MAX_UPLOAD_BYTES  # a larger downloaded image is dropped and the link sent instead
+MEDIA_OFF_ERROR = "media disabled: media is turned off for WhatsApp Agent Platform"
 
 
 def _standalone_media_paths(media_files: Any) -> list[str]:
@@ -1498,9 +1542,11 @@ async def _standalone_send(
 
     The text goes first, then each attachment (``(path, is_voice)`` tuples, or bare paths) through the same
     ``media_outbound.send_media_file`` the gateway uses, with a fresh client and no caption. Attachments go only
-    to the creator Meta confirmed, and no new file is started once ``STANDALONE_MEDIA_DEADLINE`` has passed.
-    Every file not delivered gets a ``warnings`` entry (cron reports those as run errors); ``media_delivered``
-    is set only when at least one file arrived. When nothing at all was delivered the result is an error."""
+    to the creator Meta confirmed. ``STANDALONE_MEDIA_DEADLINE`` bounds every file, including an upload or send
+    already running (Hermes cancels the whole call at ``cron.standalone_send_timeout_seconds``, 60 s by
+    default). Every file not delivered gets a ``warnings`` entry (cron reports those as run errors);
+    ``media_delivered`` is set only when at least one file arrived. When nothing at all was delivered the result
+    is an error."""
     started = time.monotonic()
     key = _api_key()
     if not key:
@@ -1559,6 +1605,7 @@ async def _standalone_media(
     creator = read_creator(home, key)
     deny_dirs = [str(state_path(home, key).parent)]
     deadline = started + STANDALONE_MEDIA_DEADLINE
+    time_limit = f"the {STANDALONE_MEDIA_DEADLINE:g}s time limit for this send"
     for index, path in enumerate(paths):
         label = _attachment_label(index, len(paths), path)
         if creator is None or to != creator:
@@ -1567,20 +1614,37 @@ async def _standalone_media(
             continue
         left = deadline - time.monotonic()
         if left <= 0:
-            warnings.append(f"{label} not sent: the {STANDALONE_MEDIA_DEADLINE:g}s time limit for this send ran out")
+            warnings.append(f"{label} not sent: {time_limit} ran out")
             continue
+        progress = media_outbound.MediaOutcome()
         try:
-            outcome = await media_outbound.send_media_file(
-                client,
-                to,
-                path,
-                requested=_standalone_kind(path),
-                force_document=bool(force_document),
-                transcoder=compat.transcode_to_ogg_opus,
-                deny_dirs=deny_dirs,
-                lock=None,
-                wait_bound=left,
+            # The deadline also bounds an upload or message already running, so the result (and its warnings)
+            # is returned before Hermes's own timer cancels the whole send and discards it.
+            outcome = await asyncio.wait_for(
+                media_outbound.send_media_file(
+                    client,
+                    to,
+                    path,
+                    requested=_standalone_kind(path),
+                    force_document=bool(force_document),
+                    transcoder=compat.transcode_to_ogg_opus,
+                    deny_dirs=deny_dirs,
+                    lock=None,
+                    wait_bound=left,
+                    outcome=progress,
+                ),
+                timeout=left,
             )
+        except TimeoutError:
+            logger.warning("%s: scheduled attachment stopped at the time limit (%s)", LABEL, progress.stage)
+            if progress.stage == media_outbound.STAGE_MESSAGE:
+                # Cancelled while the media message was in flight: Meta may have delivered it.
+                warnings.append(
+                    f"{label}: outcome unknown ({time_limit} ran out while it was being sent; it may have arrived)"
+                )
+            else:  # still preparing or uploading: no message went out (an upload alone is never shown)
+                warnings.append(f"{label} not sent: {time_limit} ran out")
+            continue
         except Exception as exc:  # never lose the text's success over one file
             logger.warning("%s: scheduled attachment failed (%s)", LABEL, type(exc).__name__)
             warnings.append(f"{label} not sent: {type(exc).__name__}")
@@ -1619,20 +1683,36 @@ def _interactive_setup() -> None:
 # Same contract as Hermes's built-in WhatsApp hint: the model writes standard markdown and
 # formatting.to_whatsapp converts it. (Asking for WhatsApp syntax directly would turn *bold*
 # into italics when converted.)
-PLATFORM_HINT = (
+HINT_BASE = (
     "You are chatting via Meta's WhatsApp Agent Platform with the person who created this "
     "agent. Standard markdown auto-converts to WhatsApp syntax (bold, italic, strike, monospace) "
     "— write markdown freely, bullets included. No tables — use bullets or labeled lines. Sent "
     "messages cannot be edited or deleted, and replies over 4000 characters are split into "
-    "several messages (max 12 per minute), so keep answers concise. "
-    "You can send files natively: write MEDIA:/absolute/path/to/file in your response, on its own line. "
-    "Images go as photos (JPEG/PNG; other formats are converted), MP4 videos play inline, audio arrives as a "
-    "normal audio file (no voice-note bubble), documents up to 16 MB, other formats arrive as files. Captions "
-    "max 1024 characters. Add [[as_document]] to send an image untouched as a file. Prefer PDF over Markdown "
-    "for documents, and zip many files into one instead of sending lots. Image URLs via ![alt](url) are "
-    "downloaded and sent as photos when possible. You can receive photos, voice notes (transcribed), videos "
-    "and documents; audio files are not transcribed."
+    "several messages (max 12 per minute), so keep answers concise."
 )
+HINT_MEDIA = (
+    "You can send files natively: write MEDIA:/absolute/path/to/file in your response, on its own line. "
+    "Images go as photos (JPEG/PNG; most other formats are converted, animated images go as files), MP4 videos "
+    "play inline, audio arrives as a normal audio file (no voice-note bubble), documents up to 16 MB, other "
+    "formats arrive as files. Captions max 1024 characters. Add [[as_document]] to send an image untouched as "
+    "a file. Prefer PDF over Markdown for documents, and zip many files into one instead of sending lots. Image "
+    "URLs via ![alt](url) are downloaded and sent as photos when possible. You can receive photos, voice notes "
+    "(transcribed), videos and documents; audio files are not transcribed."
+)
+HINT_TEXT_ONLY = "This channel is text only: you cannot send or receive files, images or voice notes here."
+PLATFORM_HINT = f"{HINT_BASE} {HINT_MEDIA}"  # media on (the default)
+TEXT_ONLY_PLATFORM_HINT = f"{HINT_BASE} {HINT_TEXT_ONLY}"  # WHATSAPP_AGENT_PLATFORM_MEDIA_ENABLED=false
+
+
+def _platform_hint() -> str:
+    """The hint for the media switch as the environment sets it when the plugin registers (Hermes loads the
+    profile's ``.env`` before plugins), parsed like the adapter's switch. Hermes keeps one hint per process, so
+    ``media_enabled: false`` set only in ``config.yaml``, or multiplexed profiles with different switches, still
+    get the full hint; ``platform_hints.whatsapp_agent_platform.replace`` covers those."""
+    try:
+        return PLATFORM_HINT if _media_enabled(None) else TEXT_ONLY_PLATFORM_HINT
+    except Exception:  # an unreadable secret scope must not break registration
+        return PLATFORM_HINT
 
 
 def register(ctx: Any) -> None:
@@ -1655,5 +1735,5 @@ def register(ctx: Any) -> None:
         max_message_length=MAX_TEXT_LENGTH,
         pii_safe=True,
         emoji="💬",
-        platform_hint=PLATFORM_HINT,
+        platform_hint=_platform_hint(),
     )

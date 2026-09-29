@@ -146,13 +146,17 @@ class MediaRejected(NotSent):
     """Meta refused the media or its fields: 131053 on upload, 131009 other than "No media found",
     or code 100 on a media send (e.g. a caption over 1024 UTF-16 units). Never retry.
 
-    ``details`` is Meta's ``error_data.details`` (may be None). It can quote a media id or MIME type, so it is
-    never part of ``str()``/``describe()``; don't log it raw.
+    ``details`` is Meta's ``error_data.details`` and ``error_message`` Meta's ``error.message`` (either may be
+    None; a live code-100 error names the bad field only in ``message``, e.g. ``"caption"``). Both can quote a
+    media id or MIME type, so neither is part of ``str()``/``repr()``/``describe()``; don't log them raw.
     """
 
-    def __init__(self, message: str, *, details: str | None = None, **kw: Any) -> None:
+    def __init__(
+        self, message: str, *, details: str | None = None, error_message: str | None = None, **kw: Any
+    ) -> None:
         super().__init__(message, **kw)
         self.details = details
+        self.error_message = error_message
 
 
 class MediaGone(NotSent):
@@ -314,6 +318,15 @@ def _error_details(response: httpx.Response) -> str | None:
     return details if isinstance(details, str) else None
 
 
+def _error_message(response: httpx.Response) -> str | None:
+    """Meta's ``error.message``, capped. Kept only on ``MediaRejected`` for classification; never logged."""
+    try:
+        message = response.json()["error"]["message"]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return message[:1024] if isinstance(message, str) else None
+
+
 def classify_media_response(response: httpx.Response, action: str) -> AgentPlatformError:
     """``classify_response`` plus the media mappings recorded live (P0 probes).
 
@@ -330,11 +343,16 @@ def classify_media_response(response: httpx.Response, action: str) -> AgentPlatf
         if code == CODE_BAD_FIELD and (details or "").strip().lower().startswith("no media found"):
             return MediaGone(f"{action}: media not found or expired", **kw)
         if code in (CODE_INVALID_PARAMETER, CODE_BAD_FIELD, CODE_MEDIA_REJECTED):
-            # Live: 100 is a bad media field such as a long caption, never a stale quote.
-            return MediaRejected(f"{action}: media or its fields rejected", details=details, **kw)
+            # Live: 100 names a bad media field (e.g. the caption). The caller treats it as a stale quote only
+            # when details or message name the quote (media_outbound.is_stale_media_quote).
+            return MediaRejected(
+                f"{action}: media or its fields rejected", details=details, error_message=_error_message(response), **kw
+            )
     elif action == "media_upload":
         if code in (CODE_BAD_FIELD, CODE_MEDIA_REJECTED) or status == 413:
-            return MediaRejected(f"{action}: media rejected", details=details, **kw)
+            return MediaRejected(
+                f"{action}: media rejected", details=details, error_message=_error_message(response), **kw
+            )
     elif action in ("media_get", "media_delete"):
         if code == CODE_INVALID_PARAMETER or status in (404, 410):
             return MediaGone(f"{action}: media not found or expired", **kw)

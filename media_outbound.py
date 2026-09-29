@@ -17,8 +17,8 @@ Order for one file:
 5. Inside ``lock``: an overflowing caption as text first (``send_text``), then the media message. ``Retryable``
    (429/503/connect) is retried with the same media id; ``MediaGone`` re-uploads once; ``MediaRejected`` is
    final; ``Ambiguous`` is never retried (the file may have arrived). A quote is dropped and the message
-   resent only when Meta's details name the quote (``context``/``message_id``): a code-100 media error is a
-   bad field such as the caption, never a stale quote.
+   resent only when Meta's error (details or message) names the quote (``context``/``message_id``): any other
+   code-100 media error is a bad field such as the caption, never a stale quote.
 
 The upload always finishes before this returns: Hermes deletes TTS and ``/save`` files right after the call.
 Nothing here logs or returns a path, filename, caption or media id.
@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import stat
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
@@ -62,6 +63,16 @@ REFUSED_NOT_FILE = "not a regular file"
 REFUSED_UNREADABLE = "file could not be read"
 REFUSED_INVALID = "file could not be prepared for WhatsApp"
 
+# Progress of one send, so a caller that times it out knows whether a message may have gone out.
+STAGE_PREPARE = "prepare"  # checks, conversion, budget wait: nothing sent
+STAGE_UPLOAD = "upload"  # uploading: an orphan upload at most, never a message
+STAGE_MESSAGE = "message"  # caption text or media message in flight: it may arrive
+STAGE_DONE = "done"
+
+# A field reference to the quote: ``context.message_id``, ``context[message_id]``, a bare ``context`` field name
+# (Meta names the bad field alone in ``message``, as live for ``caption``) or ``message_id`` as a word.
+_QUOTE_FIELD = re.compile(r"\bcontext\b\s*(?:[.\[]|$)|\bmessage_id\b", re.IGNORECASE)
+
 
 class TextNotSent(Exception):
     """Raised by a ``send_text`` callback when the caption text did not go out. ``payload`` (e.g. the text
@@ -86,6 +97,8 @@ class MediaOutcome:
     error: AgentPlatformError | None = None  # the API error that ended the attempt
     text_failure: Any = None  # ``TextNotSent.payload`` when the caption text failed
     uploads: int = 0
+    caption_sent: bool = False  # the caption already went out as its own text message
+    stage: str = STAGE_PREPARE  # how far the send got (``STAGE_*``); read by callers that cancel it
 
     @property
     def success(self) -> bool:
@@ -136,11 +149,14 @@ class _Budget:
 def is_stale_media_quote(exc: AgentPlatformError) -> bool:
     """A media send refused only because of its quote. Meta's documented error for a bad
     ``context.message_id`` has no code of its own, and code 100/131009 also mean a bad caption, media type or
-    size on a media send, so only Meta's details naming the quote count."""
+    size on a media send, so only an error whose details or message name the quote field counts. (Live, a
+    code-100 media error names its field only in ``message``, e.g. ``"caption"``, with no details.)"""
     if not isinstance(exc, MediaRejected) or exc.status != 400:
         return False
-    details = (exc.details or "").lower()
-    return "context" in details or "message_id" in details
+    for text in (exc.details, getattr(exc, "error_message", None)):
+        if isinstance(text, str) and _QUOTE_FIELD.search(text):
+            return True
+    return False
 
 
 def _load(
@@ -216,6 +232,7 @@ async def send_media_file(
     wait_bound: float = WAIT_BOUND,
     pacing_after: float = PACING_NOTICE_AFTER,
     retry_backoff: float = RETRY_BACKOFF,
+    outcome: MediaOutcome | None = None,
 ) -> MediaOutcome:
     """Send the file at ``path`` to ``to`` (an already authorised ``user:<id>``).
 
@@ -226,7 +243,9 @@ async def send_media_file(
     which must convert and split it and raise ``TextNotSent`` (or an ``AgentPlatformError``) on failure;
     without one it is sent with ``client.send_text``. ``note_filter`` may hide the "sent as a file" note
     (return ``None``/``""``). ``lock`` is an async context manager serialising sends to the recipient.
+    ``outcome`` may be passed in to watch ``stage`` from outside (e.g. to report a send cancelled by a deadline).
     """
+    outcome = outcome if outcome is not None else MediaOutcome()
     lock = lock if lock is not None else contextlib.nullcontext()
     try:
         prepared, plan, resolved = await asyncio.to_thread(
@@ -240,8 +259,10 @@ async def send_media_file(
         )
     except _Refused as exc:
         logger.warning("media not sent: %s", exc)
-        return MediaOutcome(refusal=str(exc))
-    outcome = MediaOutcome(kind=prepared.kind, mime=plan.source_mime or prepared.mime, path=resolved)
+        outcome.refusal = str(exc)
+        outcome.stage = STAGE_DONE
+        return outcome
+    outcome.kind, outcome.mime, outcome.path = prepared.kind, plan.source_mime or prepared.mime, resolved
 
     # Caption: the whole caption rides on the file only if it fits; never split between bubble and text.
     raw_caption = caption.strip() if isinstance(caption, str) else ""
@@ -283,14 +304,17 @@ async def send_media_file(
             async with lock:
                 if text_first:
                     await budget.wait_for("messages")
+                    outcome.stage = STAGE_MESSAGE
                     try:
                         await _send_caption_text(client, to, text_first, reply_to, send_text)
                     except TextNotSent as exc:
                         outcome.text_failure = exc.payload if exc.payload is not None else exc
                         return outcome
                     text_first = None
+                    outcome.caption_sent = True
                 while True:
                     await budget.wait_for("messages")
+                    outcome.stage = STAGE_MESSAGE
                     try:
                         outcome.message_id = await client.send_media(
                             to, prepared.kind, media_id, caption=media_caption, filename=filename, reply_to=quote
@@ -337,6 +361,7 @@ async def send_media_file(
     logger.info(
         "media sent: %s (%s, %d bytes, %d upload(s))", prepared.kind, prepared.mime, len(prepared.data), outcome.uploads
     )
+    outcome.stage = STAGE_DONE
     return outcome
 
 
@@ -346,6 +371,7 @@ async def _upload(
     """``POST /media``, retried once when it may simply not have happened (or happened unseen)."""
     for attempt in (1, 2):
         try:
+            outcome.stage = STAGE_UPLOAD
             outcome.uploads += 1
             return await client.upload_media(prepared.data, mime=prepared.mime, filename=prepared.filename)
         except (Retryable, Ambiguous, MalformedResponse) as exc:
