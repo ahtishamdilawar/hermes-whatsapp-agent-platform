@@ -5,6 +5,8 @@ All notable changes to this plugin are documented here. Versions follow [SemVer]
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-30
+
 ### Added
 - Receive media: photos, voice notes, audio files, videos, documents and stickers are downloaded from Meta's media
   host (`lookaside.fbsbx.com`, the only host the key is sent to besides the API; no redirects, a byte cap of
