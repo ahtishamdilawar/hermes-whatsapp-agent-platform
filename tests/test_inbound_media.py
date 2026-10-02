@@ -29,6 +29,7 @@ from wap_helpers import (
     sample_pdf,
     sample_png,
     sample_webp,
+    sha256_b64,
     text_message,
     until,
     updates_response,
@@ -406,6 +407,37 @@ async def test_download_faults_dispatch_a_note_and_polling_continues(connected, 
     else:
         assert_note_only(first, "cap")
     assert len(meta.calls("download")) <= 2  # at most two attempts
+
+
+@pytest.mark.parametrize("metadata_digest", [True, False], ids=["matching-metadata", "no-metadata-digest"])
+@pytest.mark.asyncio
+async def test_update_digest_mismatch_never_reaches_the_media_cache(connected, meta, hermes_home, metadata_digest):
+    """Valid media bytes must also match the digest in the inbound update, not just GET /media."""
+    msg = meta.inbound_image("wamid.i1", caption="look", sha256=sha256_b64(b"different original attachment"))
+    media_id = msg["image"]["id"]
+    if not metadata_digest:
+        meta.queue(
+            "media_get",
+            httpx.Response(
+                200,
+                json={
+                    "id": media_id,
+                    "url": meta.media_url(media_id),
+                    "mime_type": "image/jpeg",
+                    "file_size": len(sample_jpeg()),
+                },
+            ),
+        )
+
+    await deliver(connected, meta, msg, text_message("wamid.t1", "after"), offset=2)
+    failed, following = dispatched(connected)
+    assert_note_only(failed, "look")
+    assert media_inbound.FAILED in failed.text
+    assert cache_files(hermes_home) == []
+    assert following.text == "after"
+    assert saved_state().seen("wamid.i1")
+    assert not connected.has_fatal_error
+    assert len(meta.calls("media_get")) == 1
 
 
 @pytest.mark.asyncio
