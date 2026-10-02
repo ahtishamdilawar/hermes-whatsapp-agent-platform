@@ -245,9 +245,10 @@ class RateWindow:
                 await asyncio.sleep(wait)
 
     def penalize(self, seconds: float) -> None:
-        """After a server 429, treat the window as full for ``seconds`` (at most one window)."""
+        """After a server 429, treat the window as full for all of ``seconds``."""
         now = self._clock()
-        fill_at = now - self.window + min(self.window, max(0.0, seconds))
+        # Future stamps keep the window full until even a multi-window penalty expires.
+        fill_at = now - self.window + max(0.0, seconds)
         self._stamps = collections.deque([fill_at] * self.limit)
 
 
