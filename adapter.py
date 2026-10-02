@@ -49,7 +49,9 @@ from .client import (
     MAX_TEXT_LENGTH,
     AgentPlatformClient,
     AgentPlatformError,
+    Ambiguous,
     AuthError,
+    MalformedResponse,
     MediaGone,
     MediaRejected,
     NotCreatorError,
@@ -1577,11 +1579,16 @@ async def _standalone_send(
             return send_error(f"{exc.describe()}{partial}")
         if not paths or not media_on:
             return {"success": True, "message_id": sent[-1] if sent else None}
-        warnings, delivered = await _standalone_media(client, key, home, to, paths, force_document, started)
+        warnings, delivered, delivery_unknown = await _standalone_media(
+            client, key, home, to, paths, force_document, started
+        )
     finally:
         await client.aclose()
     if not sent and not delivered:
-        return {**send_error("no attachment could be delivered: " + "; ".join(warnings)), "warnings": warnings}
+        summary = (
+            "attachment delivery could not be confirmed" if delivery_unknown else "no attachment could be delivered"
+        )
+        return {**send_error(summary + ": " + "; ".join(warnings)), "warnings": warnings}
     result: dict[str, Any] = {"success": True, "message_id": (delivered or sent)[-1]}
     if delivered:
         result["media_delivered"] = True
@@ -1598,10 +1605,11 @@ async def _standalone_media(
     paths: list[str],
     force_document: bool,
     started: float,
-) -> tuple[list[str], list[str]]:
-    """Send each file; returns (warnings, delivered wamids)."""
+) -> tuple[list[str], list[str], bool]:
+    """Send each file; returns (warnings, delivered wamids, any unknown message delivery)."""
     warnings: list[str] = []
     delivered: list[str] = []
+    delivery_unknown = False
     creator = read_creator(home, key)
     deny_dirs = [str(state_path(home, key).parent)]
     deadline = started + STANDALONE_MEDIA_DEADLINE
@@ -1639,6 +1647,7 @@ async def _standalone_media(
             logger.warning("%s: scheduled attachment stopped at the time limit (%s)", LABEL, progress.stage)
             if progress.stage == media_outbound.STAGE_MESSAGE:
                 # Cancelled while the media message was in flight: Meta may have delivered it.
+                delivery_unknown = True
                 warnings.append(
                     f"{label}: outcome unknown ({time_limit} ran out while it was being sent; it may have arrived)"
                 )
@@ -1651,11 +1660,17 @@ async def _standalone_media(
             continue
         if outcome.success:
             delivered.append(outcome.message_id)
+        elif outcome.stage == media_outbound.STAGE_MESSAGE and isinstance(
+            outcome.error, (Ambiguous, MalformedResponse)
+        ):
+            # An upload alone is invisible; only an uncertain message may have reached the creator.
+            delivery_unknown = True
+            warnings.append(f"{label}: outcome unknown ({_standalone_failure(outcome)}; it may have arrived)")
         else:
             warnings.append(f"{label} not sent: {_standalone_failure(outcome)}")
     if delivered:
         logger.info("%s: scheduled send delivered %d of %d attachment(s)", LABEL, len(delivered), len(paths))
-    return warnings, delivered
+    return warnings, delivered, delivery_unknown
 
 
 def _interactive_setup() -> None:
