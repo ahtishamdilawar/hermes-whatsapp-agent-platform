@@ -59,6 +59,28 @@ async def test_text_then_two_files_delivered(meta, creator, tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("thread_id", ["123", "wamid.reply", " "])
+@pytest.mark.parametrize("payload", ["text", "media", "both"])
+async def test_thread_id_is_rejected_before_any_delivery(meta, creator, tmp_path, thread_id, payload):
+    message = "report" if payload != "media" else ""
+    files = [(put(tmp_path, "a.png", sample_png()), False)] if payload != "text" else []
+    result = await mod._standalone_send(None, "self", message, thread_id=thread_id, media_files=files)
+    assert not result.get("success")
+    assert "thread_id" in result["error"] and "not supported" in result["error"]
+    assert "message_id" not in result and "media_delivered" not in result
+    assert meta.calls("messages") == [] and meta.calls("media_upload") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thread_id", [None, ""])
+async def test_absent_thread_id_preserves_text_and_media_delivery(meta, creator, tmp_path, thread_id):
+    files = [(put(tmp_path, "a.png", sample_png()), False)]
+    result = await mod._standalone_send(None, "self", "report", thread_id=thread_id, media_files=files)
+    assert result["success"] is True and result["media_delivered"] is True
+    assert types_sent(meta) == ["text", "image"]
+
+
+@pytest.mark.asyncio
 async def test_bare_paths_are_tolerated(meta, creator, tmp_path):
     result = await mod._standalone_send(None, "self", "x", media_files=[put(tmp_path, "a.jpg", sample_jpeg())])
     assert result["media_delivered"] is True and types_sent(meta) == ["text", "image"]
@@ -226,7 +248,8 @@ async def test_unknown_keyword_arguments_are_accepted(meta, creator, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_through_hermes_send_to_platform(meta, creator, tmp_path, monkeypatch):
+@pytest.mark.parametrize("thread_id", [None, "", "123"])
+async def test_through_hermes_send_to_platform(meta, creator, tmp_path, monkeypatch, thread_id):
     """The real cron/send_message routing: no "attachments were omitted" warning once media was delivered."""
     send_message_tool = pytest.importorskip("tools.send_message_tool")
     send_to_platform = getattr(send_message_tool, "_send_to_platform", None)
@@ -245,9 +268,16 @@ async def test_through_hermes_send_to_platform(meta, creator, tmp_path, monkeypa
     )
     real_get = platform_registry.get
     monkeypatch.setattr(platform_registry, "get", lambda name: entry if name == mod.PLATFORM_NAME else real_get(name))
+    monkeypatch.setattr(send_message_tool, "_live_adapter", lambda platform: (None, None), raising=False)
     pconfig = SimpleNamespace(extra={})
     good = (put(tmp_path, "a.png", sample_png()), False)
-    result = await send_to_platform(Platform(mod.PLATFORM_NAME), pconfig, "self", "report", media_files=[good])
+    result = await send_to_platform(
+        Platform(mod.PLATFORM_NAME), pconfig, "self", "report", thread_id=thread_id, media_files=[good]
+    )
+    if thread_id:
+        assert not result.get("success") and "thread_id" in result["error"]
+        assert meta.calls("messages") == [] and meta.calls("media_upload") == []
+        return
     assert result["success"] is True and result["media_delivered"] is True and not result.get("warnings")
 
     missing = (str(tmp_path / "gone.pdf"), False)
