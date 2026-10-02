@@ -305,6 +305,23 @@ async def test_secret_looking_files_are_never_uploaded(ad, meta, tmp_path, name)
     assert_path_free(result, tmp_path, name)
 
 
+@pytest.mark.parametrize("source", ["secret-name", "plugin-state"])
+@pytest.mark.asyncio
+async def test_display_filename_cannot_bypass_upload_denylist(ad, meta, tmp_path, source):
+    """A harmless attachment name must not disguise a protected source file."""
+    directory = tmp_path if source == "secret-name" else ad._state.path.parent
+    name = ".env" if source == "secret-name" else "private-notes.txt"
+    path = put(directory, name, b"SECRET=do-not-upload\n")
+
+    result = await ad.send_document(CREATOR, path, file_name="report.txt")
+
+    assert not result.success
+    assert result.error == f"media not sent: {media_outbound.REFUSED_DENIED}"
+    assert result.retryable is False and result.raw_response["final"]
+    assert meta.calls("media_upload") == [] and meta.calls("messages") == []
+    assert_path_free(result, directory, name)
+
+
 @pytest.mark.asyncio
 async def test_plugin_state_dir_is_never_uploaded(ad, meta):
     assert ad._state.path.exists()
