@@ -61,7 +61,7 @@ from .client import (
 )
 from .formatting import to_whatsapp
 from .media_inbound import InboundMediaError, failure_note, fetch_inbound_media, media_hint
-from .state import PollState, key_fingerprint, read_creator, state_path
+from .state import PollState, key_fingerprint, read_creator, state_path, valid_creator_name
 
 logger = logging.getLogger(__name__)
 
@@ -583,6 +583,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             else:
                 self._note_status(wamid)
                 previous, state.creator = state.creator, sender
+                state.creator_name = state.creator_name_id = None
                 if previous is None:
                     logger.info("%s: agent creator confirmed by Meta", LABEL)
                 else:
@@ -628,6 +629,12 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         if not await self._authorize(sender, wamid):
             state.remember(wamid)
             return False
+
+        # Allowlisting is not creator confirmation. Only the pinned creator's
+        # display metadata belongs in durable polling state.
+        if sender == state.creator and valid_creator_name(self._names.get(sender)):
+            state.creator_name = self._names[sender]
+            state.creator_name_id = sender
 
         self._latest_inbound[sender] = wamid
         self._latest_inbound.move_to_end(sender)
@@ -876,7 +883,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
                 await self._run_hook("reaction hook", lambda: handler(context))
             event_handler = getattr(self, "_platform_event_handler", None)
             if event_handler is not None:
-                name = self._names.get(sender)
+                name = self._display_name(sender)
                 source = self.build_source(
                     chat_id=sender,
                     chat_name=name or "WhatsApp",
@@ -934,7 +941,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         inbound: _InboundMedia | None = None,
         quoted_media: list[tuple[str, str]] | None = None,
     ) -> MessageEvent:
-        name = self._names.get(sender)
+        name = self._display_name(sender)
         context = message.get("context") if isinstance(message.get("context"), dict) else {}
         quoted = context.get("id") if isinstance(context.get("id"), str) else None
         # The three media lists stay aligned: one type and one inlined flag per path, quoted media included.
@@ -1462,7 +1469,16 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         """Meta clears the indicator when the reply arrives (or after 25 s)."""
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
-        return {"name": self._names.get(chat_id) or "WhatsApp", "type": "dm", "chat_id": chat_id}
+        return {"name": self._display_name(chat_id) or "WhatsApp", "type": "dm", "chat_id": chat_id}
+
+    def _display_name(self, sender: str) -> str | None:
+        name = self._names.get(sender)
+        if name is not None:
+            return name
+        state = self._state
+        if state is not None and sender == state.creator == state.creator_name_id:
+            return state.creator_name
+        return None
 
 
 # ---------------------------------------------------------------- registration
