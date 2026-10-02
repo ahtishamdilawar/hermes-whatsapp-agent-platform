@@ -136,6 +136,46 @@ def test_rate_window_allows_burst_then_waits_and_penalizes():
     assert window.remaining() == 0 and window.delay() == pytest.approx(10.0)
 
 
+@pytest.mark.parametrize("seconds", [61.0, 120.0, 300.0])
+def test_rate_window_preserves_long_server_cooldown(seconds):
+    now = [100.0]
+    window = c.RateWindow(3, clock=lambda: now[0])
+    window.penalize(seconds)
+    assert window.delay() == pytest.approx(seconds)
+    now[0] += 60.0
+    assert window.remaining() == 0
+    assert not window.try_acquire()
+    assert window.delay() == pytest.approx(seconds - 60.0)
+    now[0] += seconds - 60.0
+    assert window.delay() == 0.0
+    assert window.remaining() == 3
+    assert [window.try_acquire() for _ in range(4)] == [True, True, True, False]
+    assert window.delay() == pytest.approx(60.0)
+
+
+@pytest.mark.asyncio
+async def test_send_retry_waits_for_full_server_cooldown(monkeypatch):
+    now = [100.0]
+    sleeps = []
+    meta = FakeMeta()
+    meta.queue("messages", error_response(429, 130429, {"Retry-After": "120"}))
+    api = meta.client()
+    api.limits["messages"] = c.RateWindow(3, clock=lambda: now[0])
+
+    async def sleep(seconds):
+        assert len(meta.calls("messages")) == 1
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(c.asyncio, "sleep", sleep)
+    with pytest.raises(c.RateLimited):
+        await api.send_text(CREATOR, "x")
+    await api.send_text(CREATOR, "x")
+    assert sleeps == [120.0]
+    assert now[0] == 220.0
+    assert len(meta.calls("messages")) == 2
+
+
 def test_client_requires_key():
     with pytest.raises(ValueError):
         c.AgentPlatformClient("")
