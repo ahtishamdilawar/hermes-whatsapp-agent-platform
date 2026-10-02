@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import errno
 import json
 
+import pytest
 from wap_helpers import API_KEY, CREATOR
+from wap_plugin_under_test import state as state_mod
 from wap_plugin_under_test.formatting import to_whatsapp
 from wap_plugin_under_test.state import PollState, read_creator, state_path
 
@@ -20,6 +23,42 @@ def test_state_roundtrip_never_contains_key(hermes_home):
     assert (again.next_offset, again.creator, len(again.recent_message_ids)) == (42, CREATOR, 512)
     assert again.seen("wamid.599") and not again.seen("wamid.0")
     assert read_creator(hermes_home, API_KEY) == CREATOR
+
+
+@pytest.mark.parametrize("operation", ["fsync", "replace"])
+def test_failed_save_preserves_durable_state_and_cleans_up(hermes_home, monkeypatch, operation):
+    path = state_path(hermes_home, API_KEY)
+    state = PollState(path=path, next_offset=42, start_timestamp=123, creator=CREATOR)
+    state.remember("wamid.saved")
+    state.save()
+    saved_bytes = path.read_bytes()
+
+    state.next_offset = 99
+    state.creator = "user:987654321"
+    state.remember("wamid.pending")
+    failure = OSError(errno.EIO, "injected state write failure")
+
+    def fail(*args):
+        raise failure
+
+    with monkeypatch.context() as patch:
+        patch.setattr(state_mod.os, operation, fail)
+        with pytest.raises(OSError) as caught:
+            state.save()
+    assert caught.value is failure
+    assert path.is_file()
+    assert path.read_bytes() == saved_bytes
+    restored = PollState.load(path)
+    assert (restored.next_offset, restored.start_timestamp, restored.creator) == (42, 123, CREATOR)
+    assert restored.recent_message_ids == ["wamid.saved"]
+    assert set(path.parent.iterdir()) == {path}
+
+    # Once the filesystem recovers, the same pending state can be committed.
+    state.save()
+    restored = PollState.load(path)
+    assert (restored.next_offset, restored.start_timestamp, restored.creator) == (99, 123, "user:987654321")
+    assert restored.recent_message_ids == ["wamid.saved", "wamid.pending"]
+    assert set(path.parent.iterdir()) == {path}
 
 
 def test_corrupt_state_is_quarantined_and_restarts_fresh(hermes_home):
