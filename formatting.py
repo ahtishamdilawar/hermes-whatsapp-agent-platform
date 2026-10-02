@@ -61,7 +61,7 @@ def to_whatsapp(text: str) -> str:
     ``[t](u)``→``t (u)``; fenced and inline code are left untouched."""
     if not text:
         return text
-    result, fences = _stash(r"```[\s\S]*?```", sanitize(text), "FENCE")
+    result, fences = _stash(r"```[\s\S]*?```|~~~[\s\S]*?~~~", sanitize(text), "FENCE")
     result, codes = _stash(r"`[^`\n]+`", result, "CODE")
     result = re.sub(r"(?<![\w*])\*(?!\s|\*)([^*\n]*?\S[^*\n]*?)\*(?![\w*])", r"_\1_", result)
     result = re.sub(r"\*\*(.+?)\*\*", r"*\1*", result)
