@@ -438,11 +438,14 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
         for task in list(self._background):
             task.cancel()
         self._background.clear()
-        if self._client is not None:
-            await self._client.aclose()
+        try:
+            if self._client is not None:
+                await self._client.aclose()
+        finally:
+            # Polling has stopped; a failed/cancelled close must not retain ownership.
             self._client = None
-        self._release_platform_lock()
-        self._release_guard()
+            self._release_platform_lock()
+            self._release_guard()
 
     def _release_guard(self) -> None:
         if self._fingerprint is not None:
