@@ -1546,7 +1546,9 @@ async def _standalone_send(
     already running (Hermes cancels the whole call at ``cron.standalone_send_timeout_seconds``, 60 s by
     default). Every file not delivered gets a ``warnings`` entry (cron reports those as run errors);
     ``media_delivered`` is set only when at least one file arrived. When nothing at all was delivered the result
-    is an error."""
+    is an error. Non-empty ``thread_id`` values are rejected: this platform has no thread routing."""
+    if thread_id:
+        return send_error("thread_id is not supported by WhatsApp Agent Platform; omit it to send to the chat")
     started = time.monotonic()
     key = _api_key()
     if not key:
