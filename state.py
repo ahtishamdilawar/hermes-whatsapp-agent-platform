@@ -7,6 +7,7 @@ Stored at ``<HERMES_HOME>/platforms/whatsapp_agent_platform/<key-fingerprint>.js
 * ``start_timestamp``  first activation; retained backlog older than this is skipped.
 * ``recent_message_ids`` window of handled inbound wamids (dedup across restarts).
 * ``creator``          the ``user:<id>`` Meta confirmed as the agent's creator.
+* ``creator_name`` / ``creator_name_id`` optional display name bound to that creator only.
 
 Regenerating the API key (reinstalling WhatsApp does this) changes the fingerprint, so the
 plugin starts a new file: a fresh cursor, creator re-verification and a backlog skip.
@@ -21,12 +22,24 @@ import os
 import sys
 import tempfile
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 RECENT_IDS_MAX = 512
+CREATOR_NAME_MAX = 256
+
+
+def valid_creator_name(value: object) -> bool:
+    """Bound optional display data; never restore controls or multiline metadata."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= CREATOR_NAME_MAX
+        and bool(value.strip())
+        and not any(unicodedata.category(ch) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for ch in value)
+    )
 
 
 def key_fingerprint(api_key: str) -> str:
@@ -44,6 +57,8 @@ class PollState:
     start_timestamp: int = field(default_factory=lambda: int(time.time()))
     recent_message_ids: list[str] = field(default_factory=list)
     creator: str | None = None
+    creator_name: str | None = None
+    creator_name_id: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> PollState:
@@ -65,12 +80,17 @@ class PollState:
             creator = data.get("creator")
             if not isinstance(creator, str) or not creator.startswith("user:"):
                 creator = None
+            name, name_id = data.get("creator_name"), data.get("creator_name_id")
+            if creator is None or name_id != creator or not valid_creator_name(name):
+                name, name_id = None, None
             return cls(
                 path=path,
                 next_offset=offset,
                 start_timestamp=start,
                 recent_message_ids=ids[-RECENT_IDS_MAX:],
                 creator=creator,
+                creator_name=name,
+                creator_name_id=name_id,
             )
         except (ValueError, KeyError, TypeError) as exc:
             quarantine = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
@@ -102,6 +122,9 @@ class PollState:
             "recent_message_ids": self.recent_message_ids[-RECENT_IDS_MAX:],
             "creator": self.creator,
         }
+        if self.creator is not None and self.creator_name_id == self.creator and valid_creator_name(self.creator_name):
+            payload["creator_name"] = self.creator_name
+            payload["creator_name_id"] = self.creator_name_id
         fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=".state-", suffix=".tmp")
         tmp_path = Path(tmp)
         try:

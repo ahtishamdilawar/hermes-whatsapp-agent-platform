@@ -289,7 +289,23 @@ platform_hints:
 - The API key stays in your Hermes `.env`; it is never logged or written to plugin state. The plugin's log lines
   don't contain file names, captions, media URLs or media ids.
 - State is kept in `$HERMES_HOME/platforms/whatsapp_agent_platform/<key-fingerprint>.json`: the poll cursor,
-  first-activation time, recently handled message ids and the creator's `user:<id>`.
+  first-activation time, recently handled message ids and the creator's `user:<id>`. After creator authorization,
+  an available display name is also stored in optional `creator_name` / `creator_name_id` fields, bound to that
+  confirmed id. No other contacts' names are persisted by the plugin, including rejected or allowlisted senders.
+  This is plaintext personal data in the existing atomically replaced, owner-only (0600) state file, not a secret
+  or proof of identity. Names are never used for authorization.
+- A saved creator name supplies event and chat metadata after restart when Meta omits the profile. A later
+  authorized creator message with a valid name updates it; omitted, blank, over-256-character or control-containing
+  names do not replace it. Legacy state without these fields works unchanged. Invalid or mismatched optional name
+  fields are ignored without resetting the cursor. A newly confirmed creator id clears the previous saved name;
+  it is never transferred to the new identity. Contacts-only pages and reactions do not update the saved name.
+- To forget the saved name without resetting polling, stop the gateway, remove both `creator_name` and
+  `creator_name_id` from this JSON file, then restart. A later creator message carrying a name can save it again.
+  Deleting the entire file also resets the cursor, deduplication and creator verification and skips backlog before
+  the new activation time. Regenerating the API key uses a new file but does **not** delete the old file; remove
+  obsolete state files and any backups separately. This does not erase names already stored in Hermes sessions
+  or transcripts. If a state write fails, the prior file remains intact and the existing polling retry/fatal-error
+  policy applies; the latest name is only durable after a successful save.
 - Per WhatsApp's [Third-Party Agents Terms](https://www.whatsapp.com/legal/third-party-agents-terms), agent chats are **not end-to-end encrypted**: messages
   and files pass through Meta to your Hermes instance.
 
