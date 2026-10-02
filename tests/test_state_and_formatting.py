@@ -44,6 +44,19 @@ def test_whatsapp_formatting():
     assert to_whatsapp(md) == "*Title*\n*bold* and _it_ ~gone~ site (https://x.y)\n`**code**`\n```\n**fence**\n```"
 
 
+def test_formatting_preserves_tilde_fenced_code():
+    code = "~~~python\n# Heading\n**bold** *italic* __strong__ ~~strike~~ [link](https://x.y)\n`inline`\n~~~"
+    md = f"**Before**\n{code}\n~~after~~"
+    assert to_whatsapp(md) == f"*Before*\n{code}\n~after~"
+
+
+def test_formatting_preserves_mixed_fenced_code():
+    backticks = "```\n~~~\n**backtick block**\n```"
+    tildes = "~~~\n```\n**tilde block**\n~~~"
+    md = f"{backticks}\n**between**\n{tildes}\n~~after~~"
+    assert to_whatsapp(md) == f"{backticks}\n*between*\n{tildes}\n~after~"
+
+
 def test_formatting_strips_invisible_characters():
     assert to_whatsapp("a\u2060b\u00a0c") == "ab c"
 
