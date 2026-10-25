@@ -3,7 +3,7 @@
 # on purpose — httpx is already a core Hermes dependency.
 [project]
 name = "hermes-whatsapp-agent-platform"
-version = "0.2.0"
+version = "0.2.1"
 description = "Meta WhatsApp Agent Platform adapter for Hermes Agent"
 license = "MIT"
 requires-python = ">=3.11"
@@ -11,7 +11,9 @@ dependencies = []
 
 [project.optional-dependencies]
 # Hermes itself is installed separately from git (PyPI hermes-agent is outdated).
-test = ["pytest==9.1.1", "pytest-asyncio==1.3.0"]
+# Keep this aligned with Hermes core's development group.  Plugin admission
+# resolves the plugin test extra against that environment.
+test = ["pytest==9.1.1", "pytest-asyncio==1.4.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

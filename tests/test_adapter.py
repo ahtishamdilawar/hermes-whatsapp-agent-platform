@@ -591,7 +591,7 @@ async def test_known_creator_gets_read_receipt_with_typing(meta, api_key):
 
 
 # ---------------------------------------------------------------- registration / cron
-def test_register_declares_platform_capabilities():
+def test_register_declares_platform_capabilities(monkeypatch):
     captured = {}
 
     class Ctx:
@@ -603,17 +603,14 @@ def test_register_declares_platform_capabilities():
     assert captured["required_env"] == ["WHATSAPP_AGENT_PLATFORM_API_KEY"]
     assert captured["cron_deliver_env_var"] == "WHATSAPP_AGENT_PLATFORM_HOME_CHANNEL"
     assert captured["max_message_length"] == 4096 and captured["pii_safe"] is True
-    import hermes_cli.gateway as gateway_mod
     from gateway.config import PlatformConfig
 
-    real_get = gateway_mod.get_env_value
-    try:  # status reads through the .env-backed helper, not only os.environ
-        gateway_mod.get_env_value = lambda name: "k" if name == "WHATSAPP_AGENT_PLATFORM_API_KEY" else ""
-        assert captured["is_connected"](PlatformConfig(enabled=True)) is True
-        gateway_mod.get_env_value = lambda name: ""
-        assert captured["is_connected"](PlatformConfig(enabled=True)) is False
-    finally:
-        gateway_mod.get_env_value = real_get
+    # The same process-local injection that Infisical uses makes status connected;
+    # no setup path or persistent dotenv entry is involved.
+    monkeypatch.setenv(mod.KEY_ENV, "runtime-test-key")
+    assert captured["is_connected"](PlatformConfig(enabled=True)) is True
+    monkeypatch.delenv(mod.KEY_ENV)
+    assert captured["is_connected"](PlatformConfig(enabled=True)) is False
     for hook in ("standalone_sender_fn", "parse_target_ref_fn", "env_enablement_fn", "setup_fn"):
         assert callable(captured[hook])
     # The hint must ask for markdown: WhatsApp-style *bold* from the model would be converted to italics.
@@ -622,6 +619,15 @@ def test_register_declares_platform_capabilities():
     assert captured["platform_hint"] == mod.PLATFORM_HINT
     assert "write MEDIA:/absolute/path/to/file in your response" in captured["platform_hint"]
     assert "text only" not in captured["platform_hint"].lower()
+
+
+def test_setup_only_prints_runtime_secret_instructions(capsys):
+    """The plugin must never invoke Hermes's prompt-and-write `.env` setup path."""
+    mod._setup_instructions()
+    output = capsys.readouterr().out
+    assert mod.KEY_ENV in output
+    assert "never stores" in output
+    assert "Infisical" in output
 
 
 def _registered_hint() -> str:

@@ -1658,25 +1658,18 @@ async def _standalone_media(
     return warnings, delivered
 
 
-def _interactive_setup() -> None:
-    """``hermes gateway setup`` flow: store the API key in the profile's ``.env``."""
-    from hermes_cli.cli_output import print_header, print_info, prompt
-    from hermes_cli.config import get_env_value, save_env_value
-    from hermes_cli.setup_platforms import declines_reconfigure
+def _setup_instructions() -> None:
+    """Explain runtime-only credential delivery without prompting for or writing a key.
 
-    print_header(LABEL)
-    if declines_reconfigure(LABEL, f"Reconfigure {LABEL}?", KEY_ENV):
-        return
-    print_info("In WhatsApp: Settings → Agents → create an agent, then open its chat → Chat info → API key.")
-    suffix = " [keep current]" if get_env_value(KEY_ENV) else ""
-    value = prompt(f"Agent API key{suffix}", password=True)
-    if value:
-        save_env_value(KEY_ENV, value.strip())
-    print_info(
-        "Done. Recommended in config.yaml (the platform cannot edit messages and allows "
-        "12 sends/min): display.platforms.whatsapp_agent_platform: {tool_progress: 'off', "
-        "interim_assistant_messages: false, long_running_notifications: false, "
-        "busy_ack_detail: false}"
+    ``gateway setup`` normally persists prompted UPPER_SNAKE credentials in
+    ``~/.hermes/.env``.  This adapter deliberately does not use that flow: its
+    API key is an external secret and must be injected only into the gateway
+    process at launch (for example through Infisical).
+    """
+    print(f"{LABEL}: do not enter the API key here; this setup flow never stores it.")
+    print(
+        f"Inject {KEY_ENV} from your secret manager when launching the gateway, then restart the gateway. "
+        "See the plugin README for an Infisical example."
     )
 
 
@@ -1722,12 +1715,13 @@ def register(ctx: Any) -> None:
         adapter_factory=WhatsAppAgentPlatformAdapter,
         check_fn=lambda: True,  # only needs httpx, a core Hermes dependency
         validate_config=_has_key,
-        # .env-backed and profile-aware, so `hermes gateway setup` / `hermes status` see a key
-        # stored in .env even when it is not exported into the process environment.
+        # Read through Hermes's scoped secret reader.  A launcher (for example
+        # `infisical run`) provides this process-local value; this plugin never
+        # captures or persists it.
         is_connected=env_is_connected(KEY_ENV),
         required_env=[KEY_ENV],
         install_hint=f"Set {KEY_ENV} (WhatsApp → agent chat → Chat info → API key)",
-        setup_fn=_interactive_setup,
+        setup_fn=_setup_instructions,
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var=HOME_ENV,
         parse_target_ref_fn=_parse_target,

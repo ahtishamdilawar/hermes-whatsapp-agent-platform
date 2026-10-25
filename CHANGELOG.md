@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+- Keep the test extra's `pytest-asyncio` pin aligned with Hermes core (`1.4.0`) so plugin admission can resolve
+  the combined test environment.
+- Remove the interactive API-key capture path. `hermes gateway setup` now gives runtime-only secret-manager
+  instructions and never writes the WhatsApp Agent Platform key to Hermes `.env`.
+
 All notable changes to this plugin are documented here. Versions follow [SemVer](https://semver.org/);
 `plugin.yaml` `version` always equals the release tag.
 

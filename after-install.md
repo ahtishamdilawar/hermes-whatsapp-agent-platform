@@ -1,8 +1,10 @@
 # WhatsApp Agent Platform
 
 1. In WhatsApp: **Settings → Agents → Create an agent**, then open the agent's chat → **Chat info → API key**.
-2. `hermes plugins enable whatsapp-agent-platform` (if not enabled during install) and set
-   `WHATSAPP_AGENT_PLATFORM_API_KEY` (or run `hermes gateway setup`).
+2. `hermes plugins enable whatsapp-agent-platform` (if not enabled during install). Store
+   `WHATSAPP_AGENT_PLATFORM_API_KEY` in your secret manager and inject it only into the gateway process at
+   launch. Do **not** use `hermes gateway setup` for the key: it intentionally only prints runtime-injection
+   instructions and never writes credentials.
 3. Recommended — the platform can't edit messages and allows 12 sends/minute:
 
    ```yaml

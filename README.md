@@ -42,16 +42,22 @@ the prompt). To move to a newer release once the catalog pins it, run
 `hermes plugins update whatsapp-agent-platform` and restart the gateway.
 
 Then get your key: in WhatsApp go to **Settings → Agents → Create an agent**, open the agent's chat →
-**Chat info → API key**. Store it with `hermes gateway setup` (choose *WhatsApp Agent Platform*) or add it to
-`~/.hermes/.env`:
+**Chat info → API key**. Store it in a secret manager, never in `~/.hermes/.env`, config files, or a service
+unit. This plugin intentionally does not accept the key through `hermes gateway setup`; that command only
+prints runtime-injection instructions.
+
+For example, launch a foreground gateway with [Infisical](https://infisical.com/) injecting the key only into
+that process (substitute your own trusted domain, project, environment, and least-privilege folder):
 
 ```bash
-WHATSAPP_AGENT_PLATFORM_API_KEY=your-key
+infisical run --domain https://secrets.example.com --projectId <project-id> --env prod --path /whatsapp-agent \
+  -- hermes gateway run --external-supervisor
 ```
 
-Restart the gateway (`hermes gateway restart`) and send your agent a message. `hermes gateway status` should
-list `whatsapp_agent_platform` as connected, and the log shows `WhatsApp Agent Platform: authenticated; long
-polling started`.
+The gateway reads `WHATSAPP_AGENT_PLATFORM_API_KEY` from its process environment. Restart its supervisor with
+the equivalent runtime injection and send your agent a message. `hermes gateway status`, run under the same
+injected environment, should list `whatsapp_agent_platform` as connected; the gateway log should show
+`WhatsApp Agent Platform: authenticated; long polling started`.
 
 ### Recommended display settings
 
@@ -286,8 +292,9 @@ platform_hints:
   created moments earlier. That makes it much harder for prompt injection to send arbitrary local files, but it is
   no guarantee when the agent also has shell or file-writing tools, which can copy a file first. Files still go
   only to you, but they are uploaded to Meta.
-- The API key stays in your Hermes `.env`; it is never logged or written to plugin state. The plugin's log lines
-  don't contain file names, captions, media URLs or media ids.
+- The API key is supplied only to the gateway process by your secret manager; the plugin never prompts for,
+  writes, or logs it, and never writes it to plugin state. The plugin's log lines don't contain file names,
+  captions, media URLs or media ids.
 - State is kept in `$HERMES_HOME/platforms/whatsapp_agent_platform/<key-fingerprint>.json`: the poll cursor,
   first-activation time, recently handled message ids and the creator's `user:<id>`.
 - Per WhatsApp's [Third-Party Agents Terms](https://www.whatsapp.com/legal/third-party-agents-terms), agent chats are **not end-to-end encrypted**: messages
@@ -318,7 +325,7 @@ platform_hints:
 git clone https://github.com/NousResearch/hermes-agent
 git clone https://github.com/ahtishamdilawar/hermes-whatsapp-agent-platform
 python -m venv .venv && . .venv/bin/activate      # Python 3.14 (3.11–3.13 for Hermes <= 0.21.4)
-pip install -e ./hermes-agent "pytest==9.1.1" "pytest-asyncio==1.3.0"
+pip install -e ./hermes-agent "pytest==9.1.1" "pytest-asyncio==1.4.0"
 cd hermes-whatsapp-agent-platform
 pytest                                             # protocol, adapter and real-loader tests (fake Meta API)
 hermes plugins validate . && hermes plugins doctor . --ci
