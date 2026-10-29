@@ -18,10 +18,10 @@ from wap_plugin_under_test.state import PollState, state_path
 OTHER = "user:777"
 
 
-def make_adapter():
+def make_adapter(extra: dict | None = None):
     from gateway.config import PlatformConfig
 
-    a = mod.WhatsAppAgentPlatformAdapter(PlatformConfig(enabled=True))
+    a = mod.WhatsAppAgentPlatformAdapter(PlatformConfig(enabled=True, extra=extra or {}))
     a._poll_min_interval = 0.01
     a._poll_timeout = 0
     a._backoff_base = 0.01
@@ -486,6 +486,68 @@ async def test_send_formats_and_splits_in_order_with_reply_on_first(connected, m
     assert result.message_id == "wamid.out3" and result.continuation_message_ids == ("wamid.out1", "wamid.out2")
 
 
+@pytest_asyncio.fixture
+async def prefixed(meta, api_key, monkeypatch):
+    monkeypatch.delenv(mod.REPLY_PREFIX_ENV, raising=False)
+    adapters = []
+
+    async def start(extra: dict):
+        a = make_adapter(extra)
+        assert await a.connect() is True
+        adapters.append(a)
+        return a
+
+    yield start
+    for a in adapters:
+        await a.disconnect()
+
+
+def utf16(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+@pytest.mark.asyncio
+async def test_reply_prefix_goes_on_every_part_and_each_part_still_fits(prefixed, meta):
+    prefix = "\U0001f525 " + "~" * 300
+    a = await prefixed({"reply_prefix": prefix})
+    text = "**bold** " + "\U0001f600" * 5000
+    result = await a.send(CREATOR, text, reply_to="wamid.in1")
+    bodies = meta.bodies("messages")
+    assert result.success and len(bodies) >= 2
+    assert all(b["text"]["body"].startswith(prefix) for b in bodies), "every part carries the prefix"
+    assert all(utf16(b["text"]["body"]) <= 4096 for b in bodies), "the split reserves room for the prefix"
+    assert bodies[0]["text"]["body"].startswith(prefix + "*bold* "), "the prefix is raw, the reply is converted"
+    assert bodies[0]["context"] == {"message_id": "wamid.in1"}
+    assert all("context" not in b for b in bodies[1:])
+
+
+@pytest.mark.asyncio
+async def test_reply_prefix_env_overrides_config_and_reads_backslash_n_as_newline(prefixed, meta, monkeypatch):
+    monkeypatch.setenv(mod.REPLY_PREFIX_ENV, "X\\n")
+    a = await prefixed({"reply_prefix": "\U0001f525 "})
+    assert (await a.send(CREATOR, "hello")).success
+    assert meta.bodies("messages")[0]["text"]["body"] == "X\nhello"
+
+
+@pytest.mark.asyncio
+async def test_no_reply_prefix_by_default(prefixed, meta):
+    a = await prefixed({})
+    assert (await a.send(CREATOR, "hello")).success
+    assert meta.bodies("messages")[0]["text"]["body"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_overlong_reply_prefix_is_ignored_with_a_warning(prefixed, meta, caplog):
+    prefix = "PFX" + "p" * 1997
+    a = await prefixed({"reply_prefix": prefix})
+    assert (await a.send(CREATOR, "hello")).success
+    assert meta.bodies("messages")[0]["text"]["body"] == "hello"
+    assert "reply prefix ignored" in caplog.text and "Shorten reply_prefix" in caplog.text, (
+        "names the cause and the fix"
+    )
+    assert prefix not in caplog.text and "PFX" not in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_ambiguous_500_is_sent_exactly_once_without_fallback(connected, meta):
     meta.queue("messages", error_response(500, 2))
@@ -740,3 +802,14 @@ async def test_standalone_send_targets_recorded_creator(meta, api_key, hermes_ho
     assert result["success"] is True
     assert meta.bodies("messages")[0]["to"] == CREATOR
     assert meta.bodies("messages")[0]["text"]["body"] == "*daily* report"
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_puts_the_reply_prefix_first(meta, api_key, hermes_home, monkeypatch):
+    monkeypatch.setenv(mod.REPLY_PREFIX_ENV, "\U0001f525 ")
+    state = PollState.load(state_path(hermes_home, API_KEY))
+    state.creator = CREATOR
+    state.save()
+    result = await mod._standalone_send(None, "self", "**daily** report")
+    assert result["success"] is True
+    assert meta.bodies("messages")[0]["text"]["body"] == "\U0001f525 *daily* report"

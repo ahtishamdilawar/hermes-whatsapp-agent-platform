@@ -83,10 +83,29 @@ sends a minute (see [Related Hermes settings](#related-hermes-settings)).
 | `WHATSAPP_AGENT_PLATFORM_ALLOWED_USERS` | no | — | Extra `user:<id>` senders to accept, comma-separated, in addition to the creator. |
 | `WHATSAPP_AGENT_PLATFORM_ALLOW_ALL_USERS` | no | `false` | Accept any sender Meta delivers (not recommended). |
 | `WHATSAPP_AGENT_PLATFORM_MEDIA_ENABLED` | no | `true` | `false` = text only: no files are downloaded or sent (see [Media](#media)). |
+| `WHATSAPP_AGENT_PLATFORM_REPLY_PREFIX` | no | — | Text put before every message the agent sends (see [Reply prefix](#reply-prefix)). |
 
 Disable the platform without removing the key: `gateway.platforms.whatsapp_agent_platform.enabled: false`.
 Turn off the typing indicator (read receipts are still sent):
 `gateway.platforms.whatsapp_agent_platform.typing_indicator: false`.
+
+### Reply prefix
+
+Set `reply_prefix` to put the same text before every message the agent sends, as Hermes's WhatsApp bridge does.
+The prefix is plain WhatsApp text: write `*bold*`, not `**bold**`. A literal `\n` in the value is a line break.
+`WHATSAPP_AGENT_PLATFORM_REPLY_PREFIX` sets the same value, and the variable wins.
+
+```yaml
+gateway:
+  platforms:
+    whatsapp_agent_platform:
+      reply_prefix: "🔥 "
+```
+
+Each part of a long reply gets the prefix, and the plugin shortens the parts so that each still fits Meta's limit.
+Text that goes first because a caption is too long gets it too, and so do Hermes's notices. Two kinds of message
+do not get it: a caption on a file, and the plugin's own short reply to a message it can't read ("please send
+text"). A prefix over 1024 characters is ignored, with a warning in the log.
 
 ### Who can talk to your Hermes
 

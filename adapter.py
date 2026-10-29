@@ -76,6 +76,9 @@ ALLOW_ALL_ENV = "WHATSAPP_AGENT_PLATFORM_ALLOW_ALL_USERS"
 BASE_URL_ENV = "WHATSAPP_AGENT_PLATFORM_BASE_URL"  # development only: point at a fake API
 MEDIA_ENV = "WHATSAPP_AGENT_PLATFORM_MEDIA_ENABLED"  # default on; false/0/no/off = text only
 MEDIA_KEY = "media_enabled"  # the same switch in config.yaml (platform ``extra``)
+REPLY_PREFIX_ENV = "WHATSAPP_AGENT_PLATFORM_REPLY_PREFIX"  # text put before every agent message; default none
+REPLY_PREFIX_KEY = "reply_prefix"  # Hermes's shared platform key in config.yaml (platform ``extra``)
+REPLY_PREFIX_MAX = 1024  # UTF-16 units; a longer prefix is ignored
 SELF_TARGET = "self"
 
 _USER_ID_RE = re.compile(r"^user:\S+$")
@@ -172,6 +175,25 @@ def _media_enabled(config: Any) -> bool:
     """``WHATSAPP_AGENT_PLATFORM_MEDIA_ENABLED`` (env wins), else ``media_enabled`` in the platform's config."""
     extra = getattr(config, "extra", None)
     return _on_unless_falsy(extra_or_secret(extra if isinstance(extra, dict) else None, MEDIA_KEY, MEDIA_ENV, True))
+
+
+def _reply_prefix(config: Any) -> str:
+    """``WHATSAPP_AGENT_PLATFORM_REPLY_PREFIX`` (env wins), else ``reply_prefix`` in the platform's config; a literal
+    ``\\n`` becomes a newline, as in Hermes's own WhatsApp adapter. Raw WhatsApp text, not converted from markdown."""
+    extra = getattr(config, "extra", None)
+    value = extra_or_secret(extra if isinstance(extra, dict) else None, REPLY_PREFIX_KEY, REPLY_PREFIX_ENV, "")
+    prefix = str(value or "").replace("\\n", "\n")
+    if _utf16_len(prefix) > REPLY_PREFIX_MAX:
+        logger.warning(
+            "%s: reply prefix ignored, it is %d UTF-16 units and the limit is %d. Shorten %s in config.yaml or %s.",
+            LABEL,
+            _utf16_len(prefix),
+            REPLY_PREFIX_MAX,
+            REPLY_PREFIX_KEY,
+            REPLY_PREFIX_ENV,
+        )
+        return ""
+    return prefix
 
 
 def _restrict_permissions(path: str) -> None:
@@ -291,13 +313,13 @@ def _utf16_len(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def _hard_split(chunk: str) -> list[str]:
-    if _utf16_len(chunk) <= MAX_TEXT_LENGTH:
+def _hard_split(chunk: str, limit: int = MAX_TEXT_LENGTH) -> list[str]:
+    if _utf16_len(chunk) <= limit:
         return [chunk]
     parts, current, width = [], [], 0
     for char in chunk:
         w = 2 if ord(char) > 0xFFFF else 1
-        if width + w > MAX_TEXT_LENGTH:
+        if width + w > limit:
             parts.append("".join(current))
             current, width = [], 0
         current.append(char)
@@ -307,13 +329,14 @@ def _hard_split(chunk: str) -> list[str]:
     return parts
 
 
-def _chunks(text: str) -> list[str]:
+def _chunks(text: str, prefix: str = "") -> list[str]:
     """Hermes's fence-aware splitter (counting UTF-16 units, as WhatsApp does for emoji),
-    then a hard cap at Meta's 4096."""
+    then a hard cap at Meta's 4096, with room kept for ``prefix`` on every part."""
+    reserve = _utf16_len(prefix)
     out: list[str] = []
-    for chunk in BasePlatformAdapter.truncate_message(text, CHUNK_LIMIT, len_fn=_utf16_len):
-        out.extend(_hard_split(chunk))
-    return [c for c in out if c.strip()]
+    for chunk in BasePlatformAdapter.truncate_message(text, CHUNK_LIMIT - reserve, len_fn=_utf16_len):
+        out.extend(_hard_split(chunk, MAX_TEXT_LENGTH - reserve))
+    return [prefix + c for c in out if c.strip()]
 
 
 _KEY_REGISTRY_MODULE = "_hermes_whatsapp_agent_platform_keys"
@@ -348,6 +371,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig) -> None:
         super().__init__(config, Platform(PLATFORM_NAME))
+        self._reply_prefix = _reply_prefix(config)
         self._client: AgentPlatformClient | None = None
         self._state: PollState | None = None
         self._fingerprint: str | None = None
@@ -1020,7 +1044,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
             if client.limits["messages"].remaining() <= INTERIM_SEND_RESERVE:
                 logger.debug("%s: interim message dropped to save send budget", LABEL)
                 return SendResult(success=True)
-        return await self._send_chunks(to, _chunks(to_whatsapp(content)), reply_to=reply_to)
+        return await self._send_chunks(to, _chunks(to_whatsapp(content), self._reply_prefix), reply_to=reply_to)
 
     async def _send_chunks(
         self, to: str, chunks: list[str], *, reply_to: str | None, delivered: tuple[str, ...] = ()
@@ -1340,7 +1364,7 @@ class WhatsAppAgentPlatformAdapter(BasePlatformAdapter):
 
         async def caption_text(text: str, quote: str | None) -> None:
             # Runs while media_outbound holds _send_lock: the normal text path, minus the lock.
-            result = await self._send_chunks_locked(to, _chunks(to_whatsapp(text)), reply_to=quote)
+            result = await self._send_chunks_locked(to, _chunks(to_whatsapp(text), self._reply_prefix), reply_to=quote)
             if not result.success:
                 raise media_outbound.TextNotSent(result)
 
@@ -1587,7 +1611,7 @@ async def _standalone_send(
     sent: list[str] = []
     try:
         try:
-            for chunk in _chunks(text):
+            for chunk in _chunks(text, _reply_prefix(pconfig)):
                 sent.append(await client.send_text(to, chunk))
         except AgentPlatformError as exc:
             partial = f" after {len(sent)} of the message's parts were delivered" if sent else ""

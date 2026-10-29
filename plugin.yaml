@@ -30,3 +30,6 @@ optional_env:
   - name: WHATSAPP_AGENT_PLATFORM_MEDIA_ENABLED
     description: "true (default) to receive images, voice notes, audio, video, documents and stickers and to send files; false = text only"
     password: false
+  - name: WHATSAPP_AGENT_PLATFORM_REPLY_PREFIX
+    description: "Text put before every message the agent sends, e.g. '🔥 ' (default none; also `reply_prefix` in config.yaml)"
+    password: false
