@@ -48,10 +48,10 @@ from wap_plugin_under_test.client import RateWindow
 OTHER = "user:777"
 
 
-def make_adapter():
+def make_adapter(extra: dict | None = None):
     from gateway.config import PlatformConfig
 
-    a = mod.WhatsAppAgentPlatformAdapter(PlatformConfig(enabled=True))
+    a = mod.WhatsAppAgentPlatformAdapter(PlatformConfig(enabled=True, extra=extra or {}))
     a._poll_min_interval, a._poll_timeout, a._backoff_base = 0.01, 0, 0.01
     a._media_retry_backoff = 0.0
     a.handle_message = AsyncMock()
@@ -369,6 +369,21 @@ async def test_audio_caption_goes_first_as_text(ad, meta, tmp_path):
     bodies = meta.bodies("messages")
     assert [b["type"] for b in bodies] == ["text", "audio"] and bodies[0]["text"]["body"] == "*listen*"
     assert "caption" not in bodies[1]["audio"]
+
+
+@pytest.mark.asyncio
+async def test_caption_sent_as_text_gets_the_reply_prefix(meta, api_key, tmp_path, monkeypatch):
+    monkeypatch.delenv(mod.REPLY_PREFIX_ENV, raising=False)
+    a = make_adapter({"reply_prefix": "\U0001f525 "})
+    assert await a.connect()
+    a._state.creator = CREATOR
+    try:
+        result = await a.send_voice(CREATOR, put(tmp_path, "a.mp3", sample_mp3()), caption="**listen**")
+    finally:
+        await a.disconnect()
+    assert result.success
+    bodies = meta.bodies("messages")
+    assert [b["type"] for b in bodies] == ["text", "audio"] and bodies[0]["text"]["body"] == "\U0001f525 *listen*"
 
 
 @pytest.mark.asyncio

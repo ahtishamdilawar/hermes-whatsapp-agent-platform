@@ -5,6 +5,12 @@ All notable changes to this plugin are documented here. Versions follow [SemVer]
 
 ## [Unreleased]
 
+### Added
+- `reply_prefix` (or `WHATSAPP_AGENT_PLATFORM_REPLY_PREFIX`) puts the same text before every message the agent sends,
+  as Hermes's WhatsApp bridge does. Hermes already passes the key to every platform, so a setup moving from the
+  bridge keeps its prefix. Each part of a split reply gets it, and the parts are shortened to still fit Meta's
+  4096 limit. Off by default.
+
 ## [0.2.1] - 2026-10-28
 
 ### Fixed
